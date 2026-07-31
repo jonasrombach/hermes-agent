@@ -219,17 +219,28 @@ def _check_api_supports_update_mode_append(api_url: str,
                                            api_key: str | None = None) -> bool:
     """Cached capability check for ``update_mode='append'`` on *api_url*.
 
-    Probes once per URL per process. Returns False on any probe failure —
-    that's the safe default: a per-process unique ``document_id`` and no
-    ``update_mode`` keeps the resume-overwrite fix (#6654) intact.
+    Caches the first conclusive version response per URL. Returns False on a
+    transient probe failure without caching it, so recovery can discover
+    append support on the next retain.
     """
     if not api_url:
         return False
     with _append_capability_lock:
         if api_url in _append_capability_cache:
             return _append_capability_cache[api_url]
-    version = _fetch_hindsight_api_version(api_url, api_key)
-    supported = _meets_minimum_version(version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
+    actual = _fetch_hindsight_api_version(api_url, api_key)
+    if actual is None:
+        # A transport/probe failure is not a capability result. Fall back for
+        # this retain, but do not poison the process-wide cache: the next turn
+        # must be able to discover append support after the API recovers.
+        logger.warning(
+            "Hindsight API version probe failed for %s. Falling back to "
+            "per-process document_id for this retain; the next retain will probe again.",
+            api_url,
+        )
+        return False
+
+    supported = _meets_minimum_version(actual, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
     with _append_capability_lock:
         # Re-check after acquiring the lock in case a concurrent probe filled it.
         cached = _append_capability_cache.get(api_url)
@@ -244,12 +255,12 @@ def _check_api_supports_update_mode_append(api_url: str,
             "processes/sessions create separate documents instead of "
             "appending to a session-scoped one. Upgrade Hindsight to "
             "%s+ to enable update_mode='append' deduplication.",
-            api_url, version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
+            api_url, actual, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
             _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
         )
     else:
         logger.debug("Hindsight API %s version %s supports update_mode='append'",
-                     api_url, version)
+                     api_url, actual)
     return supported
 
 

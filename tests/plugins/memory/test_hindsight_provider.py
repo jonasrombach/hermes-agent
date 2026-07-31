@@ -1253,6 +1253,34 @@ class TestUpdateModeAppendCapability:
         with _append_capability_lock:
             _append_capability_cache.clear()
 
+    def test_transient_version_probe_failure_is_not_cached(self, monkeypatch):
+        """An unreachable API must be probed again after recovery."""
+        from plugins.memory.hindsight import _check_api_supports_update_mode_append
+
+        self._clear_capability_cache()
+        versions = iter([None, "0.8.6"])
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: next(versions),
+        )
+
+        assert _check_api_supports_update_mode_append("http://transient:8888") is False
+        assert _check_api_supports_update_mode_append("http://transient:8888") is True
+
+    def test_confirmed_legacy_version_is_cached(self, monkeypatch):
+        """A real pre-0.5 response remains a stable negative capability result."""
+        from plugins.memory.hindsight import _check_api_supports_update_mode_append
+
+        self._clear_capability_cache()
+        probe = MagicMock(return_value="0.4.9")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version", probe
+        )
+
+        assert _check_api_supports_update_mode_append("http://legacy:8888") is False
+        assert _check_api_supports_update_mode_append("http://legacy:8888") is False
+        assert probe.call_count == 1
+
     def test_legacy_api_falls_back_to_per_process_doc_id(self, provider, monkeypatch):
         """API returns no /version (or pre-0.5.0) — sync_turn must use the
         per-process unique doc_id and NOT pass update_mode."""

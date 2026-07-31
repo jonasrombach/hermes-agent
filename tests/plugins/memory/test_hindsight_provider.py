@@ -441,6 +441,56 @@ class TestToolHandlers:
         assert "retain_async" not in item
 
 
+    def test_tool_retain_redacts_credentials_before_hindsight_payload(self, provider):
+        secret = "ghp_" + "".join(("testcredential", "1234567890"))
+
+        result = json.loads(
+            provider.handle_tool_call(
+                "hindsight_retain",
+                {"content": f"GitHub token: {secret}"},
+            )
+        )
+
+        assert result["result"] == "Memory stored successfully."
+        content = provider._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert secret not in content
+        assert content != f"GitHub token: {secret}"
+
+
+    def test_tool_retain_redacts_url_credentials_before_hindsight_payload(self, provider):
+        secret = "url" + "".join(("credential", "1234567890"))
+        source = f"https://alice:{secret}@example.com/cb?api_key={secret}"
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_retain",
+            {"content": source},
+        ))
+
+        assert result["result"] == "Memory stored successfully."
+        content = provider._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert secret not in content
+        assert content != source
+
+
+    def test_tool_retain_redacts_all_content_payload_fields(self, provider):
+        secret = "ghp_" + "".join(("contextcredential", "1234567890"))
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_retain",
+            {
+                "content": "safe body",
+                "context": f"context token={secret}",
+                "tags": [secret],
+            },
+        ))
+
+        assert result["result"] == "Memory stored successfully."
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        serialized = json.dumps(item)
+        assert secret not in serialized
+        assert item["content"] == "safe body"
+
+
     def test_recall_success(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_recall", {"query": "dark mode"}
@@ -766,6 +816,75 @@ class TestSyncTurn:
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
 
 
+    def test_failed_retain_keeps_unconfirmed_prefix_for_retry(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(retain_every_n_turns=1, retain_async=False)
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("test-session", "append"),
+        )
+        payloads = []
+
+        async def flaky_retain(**kwargs):
+            payloads.append(json.loads(kwargs["items"][0]["content"]))
+            if len(payloads) == 1:
+                raise RuntimeError("synthetic retain failure")
+
+        p._client.aretain_batch = AsyncMock(side_effect=flaky_retain)
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p._retain_queue.join()
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+
+        first_payload = json.dumps(payloads[0])
+        second_payload = json.dumps(payloads[1])
+        assert "turn1-user" in first_payload
+        assert "turn1-user" in second_payload
+        assert "turn2-user" in second_payload
+        assert p._last_retained_turn_count == 2
+
+
+    def test_successful_retain_advances_confirmed_watermark(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(retain_every_n_turns=1, retain_async=False)
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("test-session", "append"),
+        )
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p._retain_queue.join()
+
+        assert p._last_retained_turn_count == 1
+
+
+    def test_auto_retain_redacts_credentials_before_hindsight_payload(self, provider):
+        secret = "sk-" + "".join(("testcredential", "1234567890"))
+        provider._retain_source = secret
+        provider._retain_user_prefix = secret
+        provider._retain_assistant_prefix = secret
+
+        provider.sync_turn(
+            f"Please remember OPENAI_API_KEY={secret}",
+            "I will not store the raw credential.",
+        )
+        provider._retain_queue.join()
+
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        content = item["content"]
+        payload = json.loads(content)
+        assert secret not in json.dumps(item)
+        assert (
+            "***" in payload[0][0]["content"]
+            or "redacted" in payload[0][0]["content"].lower()
+        )
+
+
     def test_resume_creates_new_document(self, tmp_path, monkeypatch):
         """Resuming a session (re-initializing) gets a new document_id
         so previously stored content is not overwritten."""
@@ -953,6 +1072,174 @@ class TestSessionSwitchBufferFlush:
         # switch time (3 turns accumulated, _turn_index was set to 3
         # by the last sync_turn).
         assert call_order[1] == "3"
+
+
+    def test_session_switch_append_flushes_only_unretained_delta(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("test-session", "append"),
+        )
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        p._client.aretain_batch.reset_mock()
+
+        p.sync_turn("turn3-user", "turn3-asst")
+        p.on_session_switch("new-sid")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        content = json.loads(item["content"])
+        flat = json.dumps(content)
+        assert "turn3-user" in flat
+        assert "turn1-user" not in flat
+        assert "turn2-user" not in flat
+        assert item["metadata"]["message_count"] == "2"
+
+
+    def test_session_switch_append_skips_flush_when_no_delta_remains(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(retain_every_n_turns=1, retain_async=False)
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("test-session", "append"),
+        )
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p._retain_queue.join()
+        p._client.aretain_batch.reset_mock()
+
+        p.on_session_switch("new-sid")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_not_called()
+
+
+    def test_queued_retain_uses_enqueue_time_session_document_bank_and_metadata(
+        self, provider_with_config, monkeypatch
+    ):
+        import threading
+
+        p = provider_with_config(
+            retain_every_n_turns=1,
+            retain_async=False,
+            retain_tags=["old-default"],
+            retain_context="old-context",
+        )
+        p._bank_id = "old-bank"
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("old-session", "append"),
+        )
+        writer_blocked = threading.Event()
+        release_writer = threading.Event()
+
+        def blocker():
+            writer_blocked.set()
+            assert release_writer.wait(timeout=5.0)
+
+        p._ensure_writer()
+        p._retain_queue.put(blocker)
+        assert writer_blocked.wait(timeout=5.0)
+
+        p.sync_turn("old-turn-user", "old-turn-asst", session_id="old-session")
+        p._bank_id = "new-bank"
+        p._session_id = "new-session"
+        p._document_id = "new-document"
+        p._platform = "telegram"
+        p._retain_tags = ["new-default"]
+        p._retain_context = "new-context"
+        release_writer.set()
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        kwargs = p._client.aretain_batch.call_args.kwargs
+        item = kwargs["items"][0]
+        assert kwargs["bank_id"] == "old-bank"
+        assert kwargs["document_id"] == "old-session"
+        assert item["metadata"]["session_id"] == "old-session"
+        assert item["metadata"]["platform"] == "cli"
+        assert item["context"] == "old-context"
+        assert item["tags"] == ["old-default", "session:old-session"]
+
+
+    def test_switch_flush_uses_old_session_identity_after_provider_rotates(
+        self, provider_with_config, monkeypatch
+    ):
+        import threading
+
+        p = provider_with_config(
+            retain_every_n_turns=1,
+            retain_async=False,
+            retain_tags=["old-default"],
+            retain_context="old-context",
+            observation_scopes=["old-scope"],
+        )
+        p._bank_id = "old-bank"
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback: ("old-session", "append"),
+        )
+
+        writer_blocked = threading.Event()
+        release_writer = threading.Event()
+
+        def blocker():
+            writer_blocked.set()
+            assert release_writer.wait(timeout=5.0)
+
+        p._ensure_writer()
+        p._retain_queue.put(blocker)
+        assert writer_blocked.wait(timeout=5.0)
+
+        p.sync_turn("old-turn-user", "old-turn-asst", session_id="old-session")
+        p.on_session_switch("new-session")
+        p._bank_id = "new-bank"
+        p._retain_tags = ["new-default"]
+        p._retain_context = "new-context"
+        p._observation_scopes[0].append("new-scope")
+        release_writer.set()
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        kwargs = p._client.aretain_batch.call_args.kwargs
+        item = kwargs["items"][0]
+        assert kwargs["bank_id"] == "old-bank"
+        assert kwargs["document_id"] == "old-session"
+        assert item["metadata"]["session_id"] == "old-session"
+        assert item["context"] == "old-context"
+        assert item["tags"] == ["old-default", "session:old-session"]
+        assert item["observation_scopes"] == [["old-scope"]]
+        assert "old-turn-user" in item["content"]
+
+
+    def test_switch_flush_sanitizes_migrated_serialized_turns(self, provider):
+        secret = "ghp_" + "".join(("legacycredential", "1234567890"))
+        provider._session_turns.append(json.dumps([
+            {
+                "role": "user",
+                "content": f"legacy token={secret}",
+                "timestamp": "2026-01-01T00:00:00Z",
+            }
+        ]))
+
+        provider.on_session_switch("new-session")
+        provider._retain_queue.join()
+
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        parsed = json.loads(item["content"])
+        assert secret not in json.dumps(item)
+        assert parsed[0][0]["role"] == "user"
 
 
 # ---------------------------------------------------------------------------

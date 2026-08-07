@@ -788,6 +788,29 @@ class QueuedCommentaryAgent:
         }
 
 
+class SessionWakeCaptureAgent:
+    """Capture gateway controls at the real AIAgent call boundary."""
+
+    call_kwargs = None
+    call_message = None
+    skip_sync_during_call = None
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, **kwargs):
+        type(self).call_kwargs = kwargs
+        type(self).call_message = message
+        type(self).skip_sync_during_call = getattr(
+            self, "_skip_external_memory_sync_for_turn", False
+        )
+        return {
+            "final_response": "NO_REPLY",
+            "messages": [{"role": "user", "content": message}],
+            "api_calls": 1,
+        }
+
+
 class QueuedSilenceAgent:
     """First turn is intentionally silent; queued follow-up still runs."""
 
@@ -879,6 +902,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    turn_metadata=None,
+    internal_turn=False,
 ):
     if config_data:
         import yaml
@@ -924,8 +949,44 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        turn_metadata=turn_metadata,
+        internal_turn=internal_turn,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_internal_session_wake_controls_reach_agent_call(monkeypatch, tmp_path):
+    SessionWakeCaptureAgent.call_kwargs = None
+    SessionWakeCaptureAgent.call_message = None
+    SessionWakeCaptureAgent.skip_sync_during_call = None
+    metadata = {
+        "session_wake": True,
+        "delivery_id": "heartbeat:2026-08-08T00:00:00Z",
+        "coalesce_key": "rocky-heartbeat",
+        "display_kind": "hidden",
+        "skip_external_memory_sync": True,
+    }
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SessionWakeCaptureAgent,
+        session_id="sess-session-wake",
+        turn_metadata=metadata,
+        internal_turn=True,
+    )
+
+    assert result["final_response"] == "NO_REPLY"
+    assert SessionWakeCaptureAgent.call_message == "hello"
+    assert SessionWakeCaptureAgent.skip_sync_during_call is True
+    assert SessionWakeCaptureAgent.call_kwargs["persist_user_display_kind"] == "hidden"
+    assert SessionWakeCaptureAgent.call_kwargs["persist_user_display_metadata"] == {
+        "synthetic": True,
+        "source": "session_wake",
+        "delivery_id": "heartbeat:2026-08-08T00:00:00Z",
+        "coalesce_key": "rocky-heartbeat",
+    }
 
 
 @pytest.mark.asyncio

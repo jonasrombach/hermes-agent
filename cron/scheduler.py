@@ -3889,6 +3889,135 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+_SESSION_WAKE_PROMPT_FILE_MAX_BYTES = 16 * 1024
+_SESSION_WAKE_RUNTIME_LOCK = threading.Lock()
+_SESSION_WAKE_RUNTIME: tuple[Any, Any] = (None, None)
+
+
+def set_session_wake_runtime(adapters: Any, loop: Any) -> None:
+    """Publish the built-in gateway runtime for direct tool-triggered wakes."""
+    global _SESSION_WAKE_RUNTIME
+    with _SESSION_WAKE_RUNTIME_LOCK:
+        _SESSION_WAKE_RUNTIME = (adapters, loop)
+
+
+def get_session_wake_runtime() -> tuple[Any, Any]:
+    with _SESSION_WAKE_RUNTIME_LOCK:
+        return _SESSION_WAKE_RUNTIME
+
+
+def _session_wake_prompt(job: dict) -> str:
+    """Build one bounded wake prompt, reading its optional file fresh."""
+    prompt = str(job.get("prompt") or "")
+    raw_path = job.get("prompt_file")
+    if not raw_path:
+        return prompt
+
+    path = Path(str(raw_path))
+    if not path.is_absolute():
+        raise RuntimeError("Session-wake prompt_file must be an absolute path.")
+    try:
+        if not path.is_file():
+            raise RuntimeError(
+                "Session-wake prompt_file is missing or is not a regular file."
+            )
+        with path.open("rb") as handle:
+            payload = handle.read(_SESSION_WAKE_PROMPT_FILE_MAX_BYTES + 1)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"Session-wake prompt_file is unreadable: {exc}") from exc
+    if len(payload) > _SESSION_WAKE_PROMPT_FILE_MAX_BYTES:
+        raise RuntimeError(
+            "Session-wake prompt_file exceeds the 16384-byte limit."
+        )
+    try:
+        file_text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Session-wake prompt_file must be valid UTF-8.") from exc
+    label = path.name.replace("[", "").replace("]", "").replace("\n", " ")[:80]
+    label = label or "PROMPT FILE"
+    return f"{prompt}\n\n[{label}]\n{file_text}\n[END {label}]"
+
+
+def _dispatch_session_wake(job: dict, *, adapters=None, loop=None) -> None:
+    """Atomically hand a session-wake job to its captured gateway session.
+
+    This path intentionally waits only until ``deliver_wake`` returns, which for
+    push adapters means ``handle_message`` accepted the event for immediate
+    start or queueing. It does not wait for the agent turn to complete.
+    """
+    origin = _resolve_origin(job)
+    if origin is None:
+        raise RuntimeError(
+            "Session-wake dispatch requires a valid persisted origin with "
+            "platform and chat_id."
+        )
+
+    try:
+        from gateway.session import SessionSource
+
+        source = SessionSource.from_dict(origin)
+    except Exception as exc:
+        raise RuntimeError(f"Session-wake origin is malformed: {exc}") from exc
+
+    if not adapters:
+        raise RuntimeError(
+            f"Session-wake adapter is unavailable for platform {source.platform.value}."
+        )
+    adapter = adapters.get(source.platform)
+    if adapter is None:
+        raise RuntimeError(
+            f"Session-wake adapter is unavailable for platform {source.platform.value}."
+        )
+
+    if loop is None:
+        raise RuntimeError("Session-wake dispatch requires the live gateway event loop.")
+    if loop.is_closed() or not loop.is_running():
+        raise RuntimeError("Session-wake gateway event loop is not running.")
+
+    scheduled_instant = (
+        job.get("_claimed_scheduled_at")
+        or job.get("next_run_at")
+        or (job.get("fire_claim") or {}).get("at")
+    )
+    if not scheduled_instant:
+        raise RuntimeError(
+            "Session-wake dispatch requires a claimed scheduled instant or next run."
+        )
+
+    metadata = {
+        "session_wake": True,
+        "delivery_id": f"{job['id']}:{scheduled_instant}",
+        "coalesce_key": f"cron:{job['id']}",
+        "display_kind": "hidden",
+        "skip_external_memory_sync": True,
+        "event_kind": "cron_session_wake",
+    }
+
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.wake import deliver_wake
+
+    future = safe_schedule_threadsafe(
+        deliver_wake(
+            adapter,
+            text=_session_wake_prompt(job),
+            source=source,
+            metadata=metadata,
+        ),
+        loop,
+        logger=logger,
+        log_message=f"Session-wake dispatch failed for job {job['id']}",
+        log_level=logging.ERROR,
+    )
+    if future is None:
+        raise RuntimeError("Session-wake dispatch was not accepted by the gateway loop.")
+    try:
+        future.result(timeout=30)
+    except Exception as exc:
+        raise RuntimeError(f"Session-wake gateway acceptance failed: {exc}") from exc
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3930,6 +4059,20 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+
+        # A session wake resumes the exact live gateway session captured when
+        # the job was created. It must not instantiate an isolated cron agent or
+        # pass through normal cron result delivery.
+        if job.get("session_wake"):
+            _dispatch_session_wake(job, adapters=adapters, loop=loop)
+            mark_job_run(job["id"], True, None)
+            finish_execution(
+                execution_id,
+                success=True,
+                error=None,
+                delivery_outcome="accepted",
+            )
+            return True
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple

@@ -4106,7 +4106,9 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or bool(
+            getattr(self, "_skip_external_memory_sync_for_turn", False)
+        ):
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

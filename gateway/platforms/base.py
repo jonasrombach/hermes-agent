@@ -2781,6 +2781,9 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        self._session_wake_queues: Dict[str, List[MessageEvent]] = {}
+        self._discarding_session_wakes: set[str] = set()
+        self._discard_all_session_wakes = False
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
@@ -5309,6 +5312,52 @@ class BasePlatformAdapter(ABC):
     # normal completion path, (b) /stop/ /new/ /reset bypass commands,
     # and (c) stale-lock self-heal on the next inbound message.
 
+    @staticmethod
+    def _is_session_wake(event: MessageEvent) -> bool:
+        """Return whether an event is an internal session wake."""
+        return bool(
+            event.internal
+            and isinstance(event.metadata, dict)
+            and event.metadata.get("session_wake") is True
+        )
+
+    def _queue_session_wake(self, session_key: str, event: MessageEvent) -> None:
+        """Queue a wake as its own turn, coalescing matching unstarted wakes."""
+        if self._discard_all_session_wakes or session_key in self._discarding_session_wakes:
+            raise RuntimeError("Session-wake session reset is in progress.")
+        coalesce_key = event.metadata.get("coalesce_key")
+        queue = self._session_wake_queues.setdefault(session_key, [])
+        if coalesce_key:
+            for index, queued in enumerate(queue):
+                if queued.metadata.get("coalesce_key") == coalesce_key:
+                    queue[index] = event
+                    return
+        queue.append(event)
+
+    def _pop_next_follow_up(self, session_key: str) -> Optional[MessageEvent]:
+        """Pop a human follow-up first, then the oldest queued session wake."""
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            return pending
+        queue = self._session_wake_queues.get(session_key)
+        if not queue:
+            self._session_wake_queues.pop(session_key, None)
+            return None
+        event = queue.pop(0)
+        if not queue:
+            self._session_wake_queues.pop(session_key, None)
+        return event
+
+    def _restore_follow_up(self, session_key: str, event: MessageEvent) -> None:
+        """Restore a popped follow-up at the front of its original queue."""
+        if self._is_session_wake(event):
+            self._session_wake_queues.setdefault(session_key, []).insert(0, event)
+        else:
+            self._pending_messages[session_key] = event
+
+    def _discard_session_wakes(self, session_key: str) -> None:
+        self._session_wake_queues.pop(session_key, None)
+
     def _release_session_guard(
         self,
         session_key: str,
@@ -5369,6 +5418,7 @@ class BasePlatformAdapter(ABC):
         )
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        self._discard_session_wakes(session_key)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -5389,6 +5439,16 @@ class BasePlatformAdapter(ABC):
         """
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
+        discard_wakes_for_command = False
+        cmd = event.get_command()
+        if cmd:
+            from hermes_cli.commands import is_interrupt_then_dispatch
+
+            discard_wakes_for_command = bool(is_interrupt_then_dispatch(cmd))
+        if discard_wakes_for_command:
+            self._discarding_session_wakes.add(session_key)
+            self._discard_session_wakes(session_key)
+            setattr(event, "_discard_session_wakes_during_turn", True)
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
         self._session_tasks[session_key] = task
@@ -5399,6 +5459,9 @@ class BasePlatformAdapter(ABC):
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
+            if discard_wakes_for_command:
+                self._discard_session_wakes(session_key)
+                self._discarding_session_wakes.discard(session_key)
             return False
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
@@ -5424,37 +5487,45 @@ class BasePlatformAdapter(ABC):
         asyncio where the event loop's cancellation-propagation semantics
         differ subtly from a bare ``asyncio.run`` harness.
         """
-        task = self._session_tasks.pop(session_key, None)
-        if task is not None and not task.done():
-            logger.debug(
-                "[%s] Cancelling active processing for session %s",
-                self.name,
-                session_key,
-            )
-            self._expected_cancelled_tasks.add(task)
-            task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[%s] Cancelled task for %s did not exit within 5s; "
-                    "unblocking dispatch and letting the task unwind in the background",
-                    self.name, session_key,
-                )
-            except Exception:
+        if discard_pending:
+            self._discarding_session_wakes.add(session_key)
+            self._discard_session_wakes(session_key)
+        try:
+            task = self._session_tasks.pop(session_key, None)
+            if task is not None and not task.done():
                 logger.debug(
-                    "[%s] Session cancellation raised while unwinding %s",
+                    "[%s] Cancelling active processing for session %s",
                     self.name,
                     session_key,
-                    exc_info=True,
                 )
-        if discard_pending:
-            self._pending_messages.pop(session_key, None)
-            self._discard_text_debounce(session_key)
-        if release_guard:
-            self._release_session_guard(session_key)
+                self._expected_cancelled_tasks.add(task)
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] Cancelled task for %s did not exit within 5s; "
+                        "unblocking dispatch and letting the task unwind in the background",
+                        self.name, session_key,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[%s] Session cancellation raised while unwinding %s",
+                        self.name,
+                        session_key,
+                        exc_info=True,
+                    )
+            if discard_pending:
+                self._pending_messages.pop(session_key, None)
+                self._discard_session_wakes(session_key)
+                self._discard_text_debounce(session_key)
+            if release_guard:
+                self._release_session_guard(session_key)
+        finally:
+            if discard_pending:
+                self._discarding_session_wakes.discard(session_key)
 
     async def _drain_pending_after_session_command(
         self,
@@ -5468,7 +5539,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self._pop_next_follow_up(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -5564,6 +5635,9 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
+        if self._is_session_wake(event) and self._discard_all_session_wakes:
+            raise RuntimeError("Session-wake adapter is shutting down.")
+
         # Telegram topic recovery only applies to private DM topic lanes. Do
         # not submit a no-op check for group/forum/channel traffic to the
         # shared default executor: a busy pool would delay message dispatch.
@@ -5591,6 +5665,13 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # Session wakes are scheduler-owned follow-up turns. They bypass
+            # busy acknowledgements and steering, and never share the human
+            # pending slot.
+            if self._is_session_wake(event):
+                self._queue_session_wake(session_key, event)
+                return
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -5615,6 +5696,8 @@ class BasePlatformAdapter(ABC):
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
                     self._discard_text_debounce(session_key)
+                    self._discarding_session_wakes.add(session_key)
+                    self._discard_session_wakes(session_key)
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
                     except Exception as e:
@@ -5622,6 +5705,9 @@ class BasePlatformAdapter(ABC):
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
+                    finally:
+                        self._discard_session_wakes(session_key)
+                        self._discarding_session_wakes.discard(session_key)
                     return
 
                 # Other bypass commands (/approve, /deny, /status,
@@ -5809,7 +5895,10 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if (
+            getattr(self.config, "typing_indicator", True)
+            and not self._is_session_wake(event)
+        ):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -6303,9 +6392,9 @@ class BasePlatformAdapter(ABC):
             # this task hand off the follow-up.
             await self._flush_text_debounce_now(session_key)
 
-            # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            # Human follow-ups have priority over scheduler-owned wakes.
+            pending_event = self._pop_next_follow_up(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -6352,26 +6441,32 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # Session wakes are optional ambient attention. Their technical
+            # failures stay in logs rather than creating an unsolicited error
+            # message in the origin chat.
+            if not self._is_session_wake(event):
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort: do not let error reporting crash the handler
         finally:
+            if getattr(event, "_discard_session_wakes_during_turn", False):
+                self._discard_session_wakes(session_key)
+                self._discarding_session_wakes.discard(session_key)
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
@@ -6428,7 +6523,7 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = self._pop_next_follow_up(session_key)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -6444,7 +6539,7 @@ class BasePlatformAdapter(ABC):
                     # (#17758 follow-up: prevents the create_task path
                     # from racing with itself across the in-band/finally
                     # boundary).
-                    self._pending_messages[session_key] = late_pending
+                    self._restore_follow_up(session_key, late_pending)
                 else:
                     logger.debug(
                         "[%s] Late-arrival pending message during cleanup — spawning drain task",
@@ -6520,6 +6615,8 @@ class BasePlatformAdapter(ABC):
         whole shutdown path.  Stragglers are released from our tracking and
         allowed to finish unwinding on their own.
         """
+        self._discard_all_session_wakes = True
+        self._session_wake_queues.clear()
         # Loop until no new tasks appear.  Without this, a message
         # arriving during the `await asyncio.gather` below would spawn
         # a fresh _process_message_background task (added to
@@ -6564,6 +6661,8 @@ class BasePlatformAdapter(ABC):
         except Exception:
             pass
         self._pending_messages.clear()
+        self._session_wake_queues.clear()
+        self._discarding_session_wakes.clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():

@@ -253,6 +253,33 @@ class TestJobCRUD:
 
         assert "session_wake" not in job
 
+    def test_session_wake_prompt_file_contract(self, tmp_cron_dir):
+        prompt_file = tmp_cron_dir / "HEARTBEAT.md"
+        prompt_file.write_text("heartbeat stance", encoding="utf-8")
+        job = create_job(
+            prompt="ambient wrapper",
+            schedule="47 * * * *",
+            origin={"platform": "telegram", "chat_id": "123"},
+            session_wake=True,
+            prompt_file=str(prompt_file),
+        )
+        assert job["prompt_file"] == str(prompt_file)
+
+        with pytest.raises(ValueError, match="absolute"):
+            create_job(
+                prompt="wake",
+                schedule="47 * * * *",
+                origin={"platform": "telegram", "chat_id": "123"},
+                session_wake=True,
+                prompt_file="HEARTBEAT.md",
+            )
+        with pytest.raises(ValueError, match="only supported"):
+            create_job(
+                prompt="normal",
+                schedule="every 1h",
+                prompt_file=str(prompt_file),
+            )
+
     @pytest.mark.parametrize(
         ("overrides", "error_fragment"),
         [
@@ -310,6 +337,22 @@ class TestJobCRUD:
 
 
 class TestUpdateJob:
+    def test_session_wake_mode_is_immutable(self, tmp_cron_dir):
+        normal = create_job(prompt="normal", schedule="every 1h")
+        wake = create_job(
+            prompt="wake",
+            schedule="47 * * * *",
+            origin={"platform": "telegram", "chat_id": "123"},
+            session_wake=True,
+        )
+
+        with pytest.raises(ValueError, match="session_wake"):
+            update_job(normal["id"], {"session_wake": True})
+        with pytest.raises(ValueError, match="session_wake"):
+            update_job(wake["id"], {"session_wake": False})
+        with pytest.raises(ValueError, match="prompt_file"):
+            update_job(wake["id"], {"prompt_file": "/tmp/other.md"})
+
     def test_update_name(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
         assert job["name"] == "Old Name"
@@ -577,6 +620,27 @@ class TestGetDueJobs:
         from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+
+    def test_stale_session_wake_uses_current_catchup_delivery_instant(
+        self, tmp_cron_dir
+    ):
+        job = create_job(
+            prompt="wake",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "123"},
+            session_wake=True,
+        )
+        jobs = load_jobs()
+        stale = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["next_run_at"] = stale
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+
+        assert len(due) == 1
+        assert due[0]["id"] == job["id"]
+        assert due[0]["_claimed_scheduled_at"].startswith("catchup:")
+        assert due[0]["_claimed_scheduled_at"] != stale
 
 
     def test_idless_job_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):

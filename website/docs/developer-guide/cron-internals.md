@@ -185,11 +185,17 @@ Normal cron jobs run in a completely fresh agent session:
 
 A job with `session_wake: true` is the explicit exception to fresh-session isolation. `run_one_job()` bypasses normal `run_job()` inference and output delivery, reconstructs the exact persisted origin, and calls `gateway.wake.deliver_wake()` on the live gateway loop.
 
+When `prompt_file` is present, the scheduler reads that absolute path fresh before dispatch. The file must be regular, readable, valid UTF-8, and no larger than 16 KiB. Any violation fails the cron execution before the gateway accepts an event. The stored prompt remains the stable wrapper; bounded file content is appended only to the transient internal event.
+
 The synthetic `MessageEvent` is internal and carries structured delivery, coalescing, transcript-display, and external-memory-sync metadata. The platform adapter starts it immediately when idle. If the origin session is busy, the adapter stores it in a session-wake queue that is separate from `_pending_messages`, so scheduler text can never merge with human text. Human pending work drains first. Matching unstarted wake keys collapse to the newest event.
+
+Session wakes do not emit typing indicators, busy acknowledgements, steering acknowledgements, or generic platform error messages. A substantive agent response still follows normal platform delivery; exact `NO_REPLY` remains silent.
 
 Scheduler success ends at atomic gateway acceptance. The cron worker does not wait for the later agent turn, which prevents long conversations from blocking the bounded scheduler shutdown drain. An uncertain accepted wake is not replayed after process loss because a duplicate visible response is worse than skipping one optional ambient occurrence.
 
 Session-wake jobs require a captured messaging origin and reject independent execution axes: skills, scripts, `no_agent`, model/provider/base URL pins, `context_from`, `enabled_toolsets`, `workdir`, `attach_to_session`, and fan-out delivery.
+
+The current implementation is intentionally limited to the built-in in-process scheduler. External `fire_due()` callbacks such as Chronos run in a worker thread but do not receive the gateway adapter map, so a session-wake fire fails closed with an adapter-unavailable execution result.
 
 ## Skill-Backed Jobs
 

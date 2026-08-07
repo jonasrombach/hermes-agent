@@ -82,19 +82,27 @@ cronjob(
         "and return exactly NO_REPLY when there is nothing useful to say."
     ),
     session_wake=True,
+    prompt_file="/home/me/agent-workspace/HEARTBEAT.md",
 )
 ```
 
 Session wakes have strict boundaries:
 
 - a live messaging origin is required;
+- optional `prompt_file` must be absolute; it is read fresh as UTF-8 on every fire and fails closed above 16 KiB;
 - the prompt runs immediately when the origin session is idle;
 - when busy, it becomes a separate silent follow-up turn and never interrupts the active turn;
 - matching pending wakes coalesce, while human follow-ups stay ahead of ambient work;
-- exact `NO_REPLY` produces no platform message;
-- no separate model/provider pin, skills, script, `no_agent`, `workdir`, context chain, fan-out delivery, or `attach_to_session` is allowed.
+- exact `NO_REPLY` produces no platform message or typing indicator;
+- technical wake failures stay in gateway logs instead of generating unsolicited chat errors;
+- no separate model/provider pin, skills, script, `no_agent`, `workdir`, context chain, fan-out delivery, or `attach_to_session` is allowed;
+- `session_wake` and `prompt_file` are immutable after creation; recreate the job to change execution mode or source path.
 
 Cron success means the gateway accepted the event into the session. Agent completion remains part of the normal session lifecycle, so an accepted but not-yet-started wake is not replayed after a gateway crash. The next scheduled occurrence is the recovery boundary. Use this mode for optional ambient attention, not for durable workflows where every occurrence must complete.
+
+:::note Scheduler provider
+Session wakes currently require the built-in in-process cron provider because dispatch needs the gateway's live platform adapters. Managed external providers such as Chronos do not currently supply that adapter map to their fire callback.
+:::
 
 ## Letting unpinned jobs track global defaults
 

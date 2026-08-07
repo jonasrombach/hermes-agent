@@ -343,6 +343,60 @@ def _non_conversational_metadata(
     return merged
 
 
+def _turn_controls_from_metadata(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    internal: bool,
+) -> Dict[str, Any]:
+    """Translate trusted turn metadata into persistence and memory controls.
+
+    Only an internal ``session_wake`` may hide its synthetic user row. The row
+    remains role=user with unchanged content for model context, while transcript
+    surfaces receive durable provenance instead of presenting it as user input.
+    ``skip_external_memory_sync`` independently gates only the automatic
+    post-turn mirror into an external memory provider.
+    """
+    data = metadata if isinstance(metadata, dict) else {}
+    is_session_wake = bool(internal and data.get("session_wake") is True)
+    display_metadata = None
+    if is_session_wake:
+        display_metadata = {
+            "synthetic": True,
+            "source": "session_wake",
+            "delivery_id": str(data.get("delivery_id") or ""),
+        }
+        coalesce_key = data.get("coalesce_key")
+        if coalesce_key:
+            display_metadata["coalesce_key"] = str(coalesce_key)
+    return {
+        "persist_user_display_kind": "hidden" if is_session_wake else None,
+        "persist_user_display_metadata": display_metadata,
+        "skip_external_memory_sync": is_session_wake,
+    }
+
+
+def _session_wake_hook_provenance(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    internal: bool,
+) -> Optional[Dict[str, Any]]:
+    """Return trusted synthetic provenance for plugin hook consumers."""
+    data = metadata if isinstance(metadata, dict) else {}
+    if not (internal and data.get("session_wake") is True):
+        return None
+    provenance = {
+        "internal": True,
+        "synthetic": True,
+        "source": "session_wake",
+        "event_kind": str(data.get("event_kind") or "cron_session_wake"),
+        "delivery_id": str(data.get("delivery_id") or ""),
+    }
+    coalesce_key = data.get("coalesce_key")
+    if coalesce_key:
+        provenance["coalesce_key"] = str(coalesce_key)
+    return provenance
+
+
 def _seed_hygiene_system_prompt(
     agent: Any,
     session_row: Optional[Dict[str, Any]],
@@ -5305,6 +5359,17 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            _turn_controls = _turn_controls_from_metadata(
+                ctx.turn_metadata,
+                internal=ctx.internal_turn,
+            )
+            if _turn_controls["persist_user_display_kind"]:
+                _conversation_kwargs["persist_user_display_kind"] = _turn_controls[
+                    "persist_user_display_kind"
+                ]
+                _conversation_kwargs["persist_user_display_metadata"] = _turn_controls[
+                    "persist_user_display_metadata"
+                ]
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -5313,7 +5378,16 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            _previous_skip_memory_sync = getattr(
+                agent, "_skip_external_memory_sync_for_turn", False
+            )
+            agent._skip_external_memory_sync_for_turn = _turn_controls[
+                "skip_external_memory_sync"
+            ]
+            try:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            finally:
+                agent._skip_external_memory_sync_for_turn = _previous_skip_memory_sync
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -17374,6 +17448,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
+            _hook_provenance = _session_wake_hook_provenance(
+                getattr(event, "metadata", None),
+                internal=bool(getattr(event, "internal", False)),
+            )
+            if _hook_provenance is not None:
+                hook_ctx["provenance"] = _hook_provenance
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent. Capture the session id that this run was launched
@@ -17396,6 +17476,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                turn_metadata=getattr(event, "metadata", None),
+                internal_turn=bool(getattr(event, "internal", False)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -23869,6 +23951,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_metadata: Optional[Dict[str, Any]] = None,
+        internal_turn: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23888,6 +23972,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_metadata=turn_metadata,
+                internal_turn=internal_turn,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23900,6 +23986,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_metadata=turn_metadata,
+                internal_turn=internal_turn,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24022,6 +24110,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_metadata: Optional[Dict[str, Any]] = None,
+        internal_turn: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24306,6 +24396,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            turn_metadata=dict(turn_metadata or {}),
+            internal_turn=internal_turn,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -25430,6 +25522,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_turn_metadata = None
+                next_internal_turn = False
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -25462,6 +25556,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_turn_metadata = getattr(pending_event, "metadata", None)
+                    next_internal_turn = bool(getattr(pending_event, "internal", False))
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -25517,6 +25613,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    turn_metadata=next_turn_metadata,
+                    internal_turn=next_internal_turn,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

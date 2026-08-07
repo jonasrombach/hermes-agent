@@ -474,7 +474,7 @@ coalesce_key: rocky-heartbeat
 origin: current Telegram DM session
 ```
 
-Use a self-contained prompt that identifies itself as an internal scheduled heartbeat, asks Rocky to inspect the injected `HEARTBEAT.md` guidance and current conversation context, permits normal tools, and requires exact `NO_REPLY` when no contact is useful.
+Create the job with the canonical internal heartbeat wrapper as `prompt`, `session_wake=True`, and `prompt_file="/home/jonas/hermes-workspace/HEARTBEAT.md"`. The scheduler reads the UTF-8 file fresh on every fire, appends it inside `[HEARTBEAT.md]` and `[END HEARTBEAT.md]`, and fails closed if the file is missing, non-regular, unreadable, invalid, or larger than 16 KiB. Require exact `NO_REPLY` when no contact is useful.
 
 **Step 5: Verify persisted state**
 

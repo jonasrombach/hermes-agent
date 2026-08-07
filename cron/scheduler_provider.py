@@ -104,11 +104,25 @@ class CronScheduler(ABC):
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
+        # Capture the occurrence before the claim advances a recurring job's
+        # next_run_at. Session-wake delivery IDs must identify the occurrence
+        # being fired, not the following one.
+        pre_claim_job = get_job(job_id)
+        if pre_claim_job is None:
+            return False
+        claimed_scheduled_at = pre_claim_job.get("next_run_at")
+
         if not claim_job_for_fire(job_id):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+        if job.get("session_wake"):
+            job["_claimed_scheduled_at"] = (
+                claimed_scheduled_at
+                or (job.get("fire_claim") or {}).get("at")
+                or job.get("next_run_at")
+            )
         job["execution_id"] = create_execution(job_id, source=self.name)["id"]
         return run_one_job(job, adapters=adapters, loop=loop)
 
@@ -184,7 +198,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
     ):
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import set_session_wake_runtime, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -193,6 +207,7 @@ class InProcessCronScheduler(CronScheduler):
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
+        set_session_wake_runtime(adapters, loop)
 
         # ── Multiplex profiles ────────────────────────────────────────────
         # When profile_homes is set (multiplex_profiles on), tick EACH profile's

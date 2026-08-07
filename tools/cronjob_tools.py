@@ -588,6 +588,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("session_wake"):
         result["session_wake"] = True
+    if job.get("prompt_file"):
+        result["prompt_file"] = job["prompt_file"]
     return result
 
 
@@ -687,7 +689,15 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         try:
-            processed = run_one_job(job)
+            if job.get("session_wake"):
+                from cron.scheduler import get_session_wake_runtime
+
+                adapters, loop = get_session_wake_runtime()
+                wake_job = dict(job)
+                wake_job["_claimed_scheduled_at"] = f"manual:{time.time_ns()}"
+                processed = run_one_job(wake_job, adapters=adapters, loop=loop)
+            else:
+                processed = run_one_job(job)
         finally:
             _heartbeat_stop.set()
             if _heartbeat_thread is not None:
@@ -731,6 +741,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     session_wake: Optional[bool] = None,
+    prompt_file: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -806,6 +817,7 @@ def cronjob(
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
                 session_wake=_session_wake,
+                prompt_file=prompt_file,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -1137,6 +1149,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "Create-only opt-in. Queue the prompt as an internal turn in the exact live origin session instead of starting an isolated cron agent. Requires a gateway origin and a prompt. It cannot be combined with script/no_agent, skills, context chaining, model/provider pins, toolset restrictions, workdir, attach_to_session, or fan-out delivery."
             },
+            "prompt_file": {
+                "type": "string",
+                "description": "Create-only absolute UTF-8 file path for a session_wake. The scheduler reads it fresh on every fire, rejects missing/non-regular/oversized files, and appends the bounded content to the wake prompt."
+            },
         },
         "required": ["action"]
     }
@@ -1195,6 +1211,7 @@ registry.register(
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         session_wake=args.get("session_wake"),
+        prompt_file=args.get("prompt_file"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

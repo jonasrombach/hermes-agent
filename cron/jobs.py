@@ -367,8 +367,10 @@ def _jobs_lock():
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# into output writes/deletes. ``session_wake`` selects a different execution
+# and isolation model whose creation-time snapshots are not interchangeable
+# with normal cron jobs.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "session_wake", "prompt_file"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1262,6 +1264,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     session_wake: bool = False,
+    prompt_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1342,6 +1345,16 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_session_wake = bool(session_wake)
+    normalized_prompt_file = None
+    if prompt_file is not None:
+        candidate_prompt_file = str(prompt_file).strip()
+        if not candidate_prompt_file:
+            raise ValueError("prompt_file cannot be empty")
+        if not Path(candidate_prompt_file).is_absolute():
+            raise ValueError("prompt_file must be an absolute path")
+        normalized_prompt_file = candidate_prompt_file
+    if normalized_prompt_file and not normalized_session_wake:
+        raise ValueError("prompt_file is only supported for session_wake jobs")
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1475,6 +1488,8 @@ def create_job(
         job["attach_to_session"] = normalized_attach
     if normalized_session_wake:
         job["session_wake"] = True
+        if normalized_prompt_file:
+            job["prompt_file"] = normalized_prompt_file
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2515,6 +2530,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 needs_save = True
                                 break
                         record_catch_up_occurrence()
+                        if job.get("session_wake"):
+                            job = dict(job)
+                            job["_claimed_scheduled_at"] = (
+                                f"catchup:{now.isoformat()}"
+                            )
                         # Fall through to due.append(job) — execute once now
 
                 # One-shot dispatch-limit guard (issue #38758): a finite one-shot

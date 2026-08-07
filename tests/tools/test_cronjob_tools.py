@@ -246,11 +246,15 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
-    def test_create_session_wake_captures_and_surfaces_origin_mode(self, monkeypatch):
+    def test_create_session_wake_captures_and_surfaces_origin_mode(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(
             "tools.cronjob_tools._origin_from_env",
             lambda: {"platform": "telegram", "chat_id": "123"},
         )
+        prompt_file = tmp_path / "HEARTBEAT.md"
+        prompt_file.write_text("stance", encoding="utf-8")
 
         created = json.loads(
             cronjob(
@@ -259,15 +263,56 @@ class TestUnifiedCronjobTool:
                 schedule="47 * * * *",
                 deliver="local",
                 session_wake=True,
+                prompt_file=str(prompt_file),
             )
         )
 
         assert created["success"] is True
         assert created["deliver"] == "origin"
         assert created["job"]["session_wake"] is True
+        assert created["job"]["prompt_file"] == str(prompt_file)
 
         listing = json.loads(cronjob(action="list"))
         assert listing["jobs"][0]["session_wake"] is True
+        assert listing["jobs"][0]["prompt_file"] == str(prompt_file)
+
+    def test_direct_session_wake_run_uses_registered_gateway_runtime(self, monkeypatch):
+        from tools import cronjob_tools
+
+        job = {
+            "id": "wake-job",
+            "name": "wake",
+            "session_wake": True,
+        }
+        adapters = object()
+        loop = object()
+        seen = {}
+
+        monkeypatch.setattr(cronjob_tools, "claim_job_for_fire", lambda _job_id: True)
+        monkeypatch.setattr(
+            cronjob_tools,
+            "get_job",
+            lambda _job_id: {"last_status": "ok"},
+        )
+        monkeypatch.setattr(
+            "cron.scheduler.get_session_wake_runtime",
+            lambda: (adapters, loop),
+        )
+
+        def fake_run_one_job(received_job, **kwargs):
+            seen["job"] = received_job
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("cron.scheduler.run_one_job", fake_run_one_job)
+
+        result = cronjob_tools._execute_job_now(job)
+
+        assert result["success"] is True
+        assert seen["adapters"] is adapters
+        assert seen["loop"] is loop
+        assert seen["job"]["id"] == job["id"]
+        assert seen["job"]["_claimed_scheduled_at"].startswith("manual:")
 
     def test_create_session_wake_requires_live_origin(self, monkeypatch):
         monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda: None)

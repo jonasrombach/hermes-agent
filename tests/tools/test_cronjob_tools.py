@@ -246,6 +246,44 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_session_wake_captures_and_surfaces_origin_mode(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.cronjob_tools._origin_from_env",
+            lambda: {"platform": "telegram", "chat_id": "123"},
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Run the scheduled heartbeat",
+                schedule="47 * * * *",
+                deliver="local",
+                session_wake=True,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["deliver"] == "origin"
+        assert created["job"]["session_wake"] is True
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["session_wake"] is True
+
+    def test_create_session_wake_requires_live_origin(self, monkeypatch):
+        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda: None)
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Run the scheduled heartbeat",
+                schedule="47 * * * *",
+                session_wake=True,
+            )
+        )
+
+        assert result["success"] is False
+        assert "origin" in result["error"].lower()
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

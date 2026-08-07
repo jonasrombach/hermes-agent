@@ -234,6 +234,55 @@ class TestJobCRUD:
         )
         assert job["deliver"] == "origin"
 
+    def test_session_wake_persists_origin_only_execution_mode(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Run the scheduled heartbeat",
+            schedule="47 * * * *",
+            deliver="local",
+            origin={"platform": "telegram", "chat_id": "123"},
+            session_wake=True,
+        )
+
+        assert job["session_wake"] is True
+        assert job["deliver"] == "origin"
+        assert job["origin"] == {"platform": "telegram", "chat_id": "123"}
+        assert get_job(job["id"])["session_wake"] is True
+
+    def test_standard_job_omits_session_wake_field(self, tmp_cron_dir):
+        job = create_job(prompt="ordinary", schedule="every 1h")
+
+        assert "session_wake" not in job
+
+    @pytest.mark.parametrize(
+        ("overrides", "error_fragment"),
+        [
+            ({"origin": None}, "origin"),
+            ({"no_agent": True}, "no_agent"),
+            ({"script": "collector.py"}, "script"),
+            ({"skills": ["some-skill"]}, "skills"),
+            ({"context_from": ["job-a"]}, "context_from"),
+            ({"enabled_toolsets": ["web"]}, "enabled_toolsets"),
+            ({"workdir": "/tmp"}, "workdir"),
+            ({"model": "some-model"}, "model"),
+            ({"provider": "some-provider"}, "provider"),
+            ({"base_url": "https://example.invalid/v1"}, "base_url"),
+            ({"attach_to_session": True}, "attach_to_session"),
+        ],
+    )
+    def test_session_wake_rejects_isolated_cron_axes(
+        self, tmp_cron_dir, overrides, error_fragment
+    ):
+        kwargs = {
+            "prompt": "heartbeat",
+            "schedule": "47 * * * *",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            "session_wake": True,
+            **overrides,
+        }
+
+        with pytest.raises(ValueError, match=error_fragment):
+            create_job(**kwargs)
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):

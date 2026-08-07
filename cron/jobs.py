@@ -1261,6 +1261,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    session_wake: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1306,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        session_wake: When True, dispatch ``prompt`` as an internal turn in the
+                      captured origin session instead of starting an isolated
+                      cron agent. This mode owns no independent agent axes.
 
     Returns:
         The created job dict
@@ -1337,6 +1341,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_session_wake = bool(session_wake)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1357,6 +1362,39 @@ def create_job(
 
     prompt_text = _coerce_job_text(prompt)
 
+    if normalized_session_wake:
+        if not prompt_text.strip():
+            raise ValueError("session_wake requires a non-empty prompt")
+        if not (
+            isinstance(origin, dict)
+            and str(origin.get("platform") or "").strip()
+            and str(origin.get("chat_id") or "").strip()
+        ):
+            raise ValueError(
+                "session_wake requires a live origin with platform and chat_id"
+            )
+        conflicting_axes = {
+            "no_agent": normalized_no_agent,
+            "script": bool(normalized_script),
+            "skills": bool(normalized_skills),
+            "context_from": bool(context_from),
+            "enabled_toolsets": bool(normalized_toolsets),
+            "workdir": bool(normalized_workdir),
+            "model": bool(normalized_model),
+            "provider": bool(normalized_provider),
+            "base_url": bool(normalized_base_url),
+            "attach_to_session": normalized_attach is not None,
+        }
+        conflicts = [name for name, present in conflicting_axes.items() if present]
+        if conflicts:
+            raise ValueError(
+                "session_wake cannot use isolated cron field(s): "
+                + ", ".join(conflicts)
+            )
+        # The wake always targets the exact captured origin. Fan-out and local
+        # output are normal cron-delivery concepts and do not apply.
+        deliver = "origin"
+
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
     # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive
     # (#30719). Enforced here (not only in the CLI layer) so the agent's
@@ -1367,12 +1405,15 @@ def create_job(
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
-    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-        provider=normalized_provider,
-        model=normalized_model,
-        base_url=normalized_base_url,
-        no_agent=normalized_no_agent,
-    )
+    if normalized_session_wake:
+        provider_snapshot, model_snapshot = None, None
+    else:
+        provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+            provider=normalized_provider,
+            model=normalized_model,
+            base_url=normalized_base_url,
+            no_agent=normalized_no_agent,
+        )
 
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
@@ -1432,6 +1473,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_session_wake:
+        job["session_wake"] = True
 
     with _jobs_lock():
         jobs = load_jobs()

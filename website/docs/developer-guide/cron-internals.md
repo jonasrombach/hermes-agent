@@ -16,6 +16,7 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 | `cron/scheduler.py` | Scheduler loop — due-job detection, execution, repeat tracking |
 | `tools/cronjob_tools.py` | Model-facing `cronjob` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
+| `gateway/wake.py` | Session-wake dispatch into an existing origin session |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
 
 ## Scheduling Model
@@ -173,12 +174,22 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
 
-Each cron job runs in a completely fresh agent session:
+Normal cron jobs run in a completely fresh agent session:
 
 - No conversation history from previous runs
 - No memory of previous cron executions (unless persisted to memory/files)
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
+
+### Session-Wake Execution
+
+A job with `session_wake: true` is the explicit exception to fresh-session isolation. `run_one_job()` bypasses normal `run_job()` inference and output delivery, reconstructs the exact persisted origin, and calls `gateway.wake.deliver_wake()` on the live gateway loop.
+
+The synthetic `MessageEvent` is internal and carries structured delivery, coalescing, transcript-display, and external-memory-sync metadata. The platform adapter starts it immediately when idle. If the origin session is busy, the adapter stores it in a session-wake queue that is separate from `_pending_messages`, so scheduler text can never merge with human text. Human pending work drains first. Matching unstarted wake keys collapse to the newest event.
+
+Scheduler success ends at atomic gateway acceptance. The cron worker does not wait for the later agent turn, which prevents long conversations from blocking the bounded scheduler shutdown drain. An uncertain accepted wake is not replayed after process loss because a duplicate visible response is worse than skipping one optional ambient occurrence.
+
+Session-wake jobs require a captured messaging origin and reject independent execution axes: skills, scripts, `no_agent`, model/provider/base URL pins, `context_from`, `enabled_toolsets`, `workdir`, `attach_to_session`, and fan-out delivery.
 
 ## Skill-Backed Jobs
 

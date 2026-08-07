@@ -17,6 +17,7 @@ Cron jobs can:
 - attach zero, one, or multiple skills to a job
 - deliver results back to the origin chat, local files, or configured platform targets
 - run in fresh agent sessions with the normal static tool list
+- opt into a **session wake** that queues a real internal turn in the exact origin conversation
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
@@ -66,6 +67,34 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 ```
 
 Hermes will use the unified `cronjob` tool internally.
+
+### Session-wake jobs
+
+`session_wake=True` is a narrow opt-in for ambient checks that require the current conversation history and normal tools. Instead of creating an isolated cron agent and delivering its final output afterward, Hermes submits the stored prompt as an internal turn to the exact chat and topic where the job was created.
+
+```python
+cronjob(
+    action="create",
+    name="Hourly ambient check",
+    schedule="47 * * * *",
+    prompt=(
+        "This is an internal scheduled check. Inspect the current conversation "
+        "and return exactly NO_REPLY when there is nothing useful to say."
+    ),
+    session_wake=True,
+)
+```
+
+Session wakes have strict boundaries:
+
+- a live messaging origin is required;
+- the prompt runs immediately when the origin session is idle;
+- when busy, it becomes a separate silent follow-up turn and never interrupts the active turn;
+- matching pending wakes coalesce, while human follow-ups stay ahead of ambient work;
+- exact `NO_REPLY` produces no platform message;
+- no separate model/provider pin, skills, script, `no_agent`, `workdir`, context chain, fan-out delivery, or `attach_to_session` is allowed.
+
+Cron success means the gateway accepted the event into the session. Agent completion remains part of the normal session lifecycle, so an accepted but not-yet-started wake is not replayed after a gateway crash. The next scheduled occurrence is the recovery boundary. Use this mode for optional ambient attention, not for durable workflows where every occurrence must complete.
 
 ## Letting unpinned jobs track global defaults
 
@@ -233,7 +262,7 @@ What they do:
 
 ## How it works
 
-**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
+**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds. Normal due jobs run in isolated agent sessions; session-wake jobs enter their captured origin session.
 
 ```bash
 hermes gateway install     # Install as a user service
@@ -250,10 +279,10 @@ On each tick Hermes:
 
 1. loads jobs from `~/.hermes/cron/jobs.json`
 2. checks `next_run_at` against the current time
-3. starts a fresh `AIAgent` session for each due job
-4. optionally injects one or more attached skills into that fresh session
-5. runs the prompt to completion
-6. delivers the final response
+3. starts a fresh `AIAgent` session for a normal job, or submits a session wake to its captured origin
+4. optionally injects one or more attached skills into a normal fresh session
+5. runs the normal prompt to completion, or records the wake after gateway acceptance
+6. delivers the normal job's final response; session-wake responses use the ordinary conversation path
 7. updates run metadata and the next scheduled time
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.

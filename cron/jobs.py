@@ -1547,6 +1547,45 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _validate_stored_session_wake(job: Dict[str, Any]) -> None:
+    """Reject effective job shapes that would widen a session wake.
+
+    Creation performs the same checks on normalized arguments. This second
+    gate is intentionally applied after updates are merged so an ordinary edit
+    cannot turn a valid wake into a hybrid isolated-agent or fan-out job.
+    """
+    if not job.get("session_wake"):
+        return
+    if not (
+        isinstance(job.get("origin"), dict)
+        and str(job["origin"].get("platform") or "").strip()
+        and str(job["origin"].get("chat_id") or "").strip()
+    ):
+        raise ValueError("session_wake requires a live origin")
+    if not str(job.get("prompt") or "").strip():
+        raise ValueError("session_wake requires a non-empty prompt")
+
+    conflicting_axes = {
+        "no_agent": bool(job.get("no_agent")),
+        "script": bool(job.get("script")),
+        "skills": bool(job.get("skills") or job.get("skill")),
+        "context_from": bool(job.get("context_from")),
+        "enabled_toolsets": bool(job.get("enabled_toolsets")),
+        "workdir": bool(job.get("workdir")),
+        "model": bool(job.get("model")),
+        "provider": bool(job.get("provider")),
+        "base_url": bool(job.get("base_url")),
+        "attach_to_session": "attach_to_session" in job,
+        "deliver": job.get("deliver", "origin") != "origin",
+    }
+    conflicts = [name for name, present in conflicting_axes.items() if present]
+    if conflicts:
+        raise ValueError(
+            "session_wake cannot use isolated cron field(s): "
+            + ", ".join(conflicts)
+        )
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
@@ -1584,6 +1623,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            _validate_stored_session_wake(updated)
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]

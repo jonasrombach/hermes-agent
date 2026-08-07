@@ -551,7 +551,7 @@ For each accepted defect:
 
 **Step 1: Load and follow the `safe-restart` skill**
 
-Prepare the tested runtime using the repository's supported install path. Verify the installed revision and import path before restart. Jonas normally performs restart, but his explicit assignment to finish the feature permits the safest available automated handoff only if the skill and live service support it without lockout risk. Otherwise report the exact manual restart blocker.
+Prepare the tested runtime using the repository's supported install path. Verify the installed revision and import path before restart. Then ask Jonas to perform the restart and stop. The `safe-restart` skill requires this owner handoff even when the surrounding feature assignment is already authorized. Resume post-restart verification only after Jonas confirms the Gateway is back.
 
 **Step 2: Verify post-restart health**
 

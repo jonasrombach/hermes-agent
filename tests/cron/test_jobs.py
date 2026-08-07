@@ -283,6 +283,31 @@ class TestJobCRUD:
         with pytest.raises(ValueError, match=error_fragment):
             create_job(**kwargs)
 
+    @pytest.mark.parametrize(
+        ("updates", "error_fragment"),
+        [
+            ({"skills": ["some-skill"]}, "skills"),
+            ({"script": "collector.py"}, "script"),
+            ({"no_agent": True}, "no_agent"),
+            ({"workdir": "/tmp"}, "workdir"),
+            ({"provider": "some-provider"}, "provider"),
+            ({"deliver": "all"}, "deliver"),
+            ({"attach_to_session": False}, "attach_to_session"),
+        ],
+    )
+    def test_update_session_wake_rejects_isolated_cron_axes(
+        self, tmp_cron_dir, updates, error_fragment
+    ):
+        job = create_job(
+            prompt="heartbeat",
+            schedule="47 * * * *",
+            origin={"platform": "telegram", "chat_id": "123"},
+            session_wake=True,
+        )
+
+        with pytest.raises(ValueError, match=error_fragment):
+            update_job(job["id"], updates)
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):

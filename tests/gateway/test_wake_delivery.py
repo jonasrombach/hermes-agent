@@ -53,6 +53,42 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+def test_deliver_wake_push_copies_session_wake_metadata():
+    metadata = {
+        "session_wake": True,
+        "delivery_id": "heartbeat:2026-08-07T21:47:00Z",
+        "coalesce_key": "rocky-heartbeat",
+        "display_kind": "hidden",
+        "skip_external_memory_sync": True,
+    }
+    adapter = PushAdapter()
+
+    asyncio.run(
+        deliver_wake(
+            adapter,
+            text="heartbeat",
+            source=_source(),
+            metadata=metadata,
+        )
+    )
+
+    event = adapter.handled[0]
+    assert event.internal is True
+    assert event.metadata == metadata
+    assert event.metadata is not metadata
+
+    metadata["delivery_id"] = "mutated-after-dispatch"
+    assert event.metadata["delivery_id"] == "heartbeat:2026-08-07T21:47:00Z"
+
+
+def test_deliver_wake_push_defaults_to_empty_metadata():
+    adapter = PushAdapter()
+
+    asyncio.run(deliver_wake(adapter, text="wake", source=_source()))
+
+    assert adapter.handled[0].metadata == {}
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web

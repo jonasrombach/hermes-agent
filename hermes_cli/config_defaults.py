@@ -1434,7 +1434,7 @@ DEFAULT_CONFIG = {
             "voice_id": "pNInz6obpgDQGcFmaJgB",  # Adam
             "model_id": "eleven_multilingual_v2",
             "speed": None,  # optional; 0.7 - 1.2
-            "apply_text_normalization": None,  # optional; auto, on, or off
+            "apply_text_normalization": "auto",  # auto, on, or off
         },
         "openai": {
             "model": "gpt-4o-mini-tts",

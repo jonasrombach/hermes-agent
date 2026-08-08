@@ -358,6 +358,14 @@ class TestStringTypedConfigValues:
         assert saved["approvals"]["mode"] == value
         assert isinstance(saved["approvals"]["mode"], str)
 
+    def test_elevenlabs_text_normalization_on_stays_string(self, _isolated_hermes_home):
+        set_config_value("tts.elevenlabs.apply_text_normalization", "on")
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["tts"]["elevenlabs"]["apply_text_normalization"] == "on"
+        assert isinstance(saved["tts"]["elevenlabs"]["apply_text_normalization"], str)
+
     @pytest.mark.parametrize("key, value, expected", [
         ("terminal.persistent_shell", "off", False),
         ("approvals.timeout", "30", 30),

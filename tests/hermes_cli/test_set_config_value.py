@@ -493,6 +493,8 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "tts.elevenlabs.speed",
+        "tts.elevenlabs.apply_text_normalization",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key

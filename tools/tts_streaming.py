@@ -231,6 +231,7 @@ class ElevenLabsStreamer(StreamingTTSProvider):
         from tools.tts_tool import (
             DEFAULT_ELEVENLABS_STREAMING_MODEL_ID,
             DEFAULT_ELEVENLABS_VOICE_ID,
+            _elevenlabs_convert_options,
             _elevenlabs_environment_kwargs,
             _import_elevenlabs,
         )
@@ -249,6 +250,7 @@ class ElevenLabsStreamer(StreamingTTSProvider):
             voice_id=voice_id,
             model_id=model_id,
             output_format="pcm_24000",
+            **_elevenlabs_convert_options(self.tts_config),
         )
 
 

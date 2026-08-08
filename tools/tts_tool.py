@@ -138,6 +138,35 @@ def _import_elevenlabs():
     return ElevenLabs
 
 
+def _import_elevenlabs_voice_settings():
+    """Lazy import the ElevenLabs voice-settings model."""
+    from elevenlabs import VoiceSettings
+
+    return VoiceSettings
+
+
+def _elevenlabs_convert_options(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build optional ElevenLabs request fields from TTS configuration."""
+    el_config = tts_config.get("elevenlabs") or {}
+    options: Dict[str, Any] = {}
+
+    normalization = el_config.get("apply_text_normalization")
+    if normalization is not None:
+        normalization = str(normalization).strip().lower()
+        if normalization not in {"auto", "on", "off"}:
+            raise ValueError(
+                "tts.elevenlabs.apply_text_normalization must be auto, on, or off"
+            )
+        options["apply_text_normalization"] = normalization
+
+    speed = el_config.get("speed")
+    if speed is not None:
+        VoiceSettings = _import_elevenlabs_voice_settings()
+        options["voice_settings"] = VoiceSettings(speed=float(speed))
+
+    return options
+
+
 def _elevenlabs_environment_kwargs(el_config: Dict[str, Any]) -> Dict[str, Any]:
     """Build ElevenLabs client kwargs honoring config base_url/wss_url.
 
@@ -1431,6 +1460,7 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
+        **_elevenlabs_convert_options(tts_config),
     )
 
     # audio_generator yields chunks -- write them all

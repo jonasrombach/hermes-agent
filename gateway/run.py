@@ -343,6 +343,15 @@ def _non_conversational_metadata(
     return merged
 
 
+def _trusted_internal_ambient(metadata: Optional[Dict[str, Any]], *, internal: bool) -> bool:
+    """Whether trusted metadata marks a hidden background follow-up turn."""
+    data = metadata if isinstance(metadata, dict) else {}
+    return bool(
+        internal
+        and (data.get("session_wake") is True or data.get("internal_ambient") is True)
+    )
+
+
 def _turn_controls_from_metadata(
     metadata: Optional[Dict[str, Any]],
     *,
@@ -357,21 +366,21 @@ def _turn_controls_from_metadata(
     post-turn mirror into an external memory provider.
     """
     data = metadata if isinstance(metadata, dict) else {}
-    is_session_wake = bool(internal and data.get("session_wake") is True)
+    is_ambient = _trusted_internal_ambient(data, internal=internal)
     display_metadata = None
-    if is_session_wake:
+    if is_ambient:
         display_metadata = {
             "synthetic": True,
-            "source": "session_wake",
+            "source": "ambient" if data.get("internal_ambient") is True else "session_wake",
             "delivery_id": str(data.get("delivery_id") or ""),
         }
         coalesce_key = data.get("coalesce_key")
         if coalesce_key:
             display_metadata["coalesce_key"] = str(coalesce_key)
     return {
-        "persist_user_display_kind": "hidden" if is_session_wake else None,
+        "persist_user_display_kind": "hidden" if is_ambient else None,
         "persist_user_display_metadata": display_metadata,
-        "skip_external_memory_sync": is_session_wake,
+        "skip_external_memory_sync": is_ambient,
     }
 
 
@@ -382,18 +391,23 @@ def _session_wake_hook_provenance(
 ) -> Optional[Dict[str, Any]]:
     """Return trusted synthetic provenance for plugin hook consumers."""
     data = metadata if isinstance(metadata, dict) else {}
-    if not (internal and data.get("session_wake") is True):
+    if not _trusted_internal_ambient(data, internal=internal):
         return None
+    is_plugin_ambient = data.get("internal_ambient") is True
     provenance = {
         "internal": True,
         "synthetic": True,
-        "source": "session_wake",
-        "event_kind": str(data.get("event_kind") or "cron_session_wake"),
+        "source": "ambient" if is_plugin_ambient else "session_wake",
+        "event_kind": str(
+            data.get("event_kind") or ("ambient" if is_plugin_ambient else "cron_session_wake")
+        ),
         "delivery_id": str(data.get("delivery_id") or ""),
     }
     coalesce_key = data.get("coalesce_key")
     if coalesce_key:
         provenance["coalesce_key"] = str(coalesce_key)
+    if is_plugin_ambient and data.get("source_label"):
+        provenance["source_label"] = str(data["source_label"])
     return provenance
 
 
@@ -5890,6 +5904,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        from hermes_cli.lifecycle import GatewayLifecycleTasks
+        self._plugin_lifecycle_tasks = GatewayLifecycleTasks()
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -11306,6 +11322,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._update_runtime_status("running")
 
+        # Publish one shared internal-wake runtime for cron/heartbeat and
+        # plugin ambient producers. Plugins only receive the validating
+        # AmbientTurnService facade, never this runner or its adapter maps.
+        from gateway.wake import set_wake_runtime
+        from hermes_cli.lifecycle import invoke_hook_async
+
+        set_wake_runtime(self, asyncio.get_running_loop())
+        await invoke_hook_async(
+            "gateway_startup",
+            tasks=self._plugin_lifecycle_tasks,
+        )
+
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
         # other background tasks during stop(). Best-effort — a liveness probe
@@ -12755,6 +12783,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            # Reject new plugin wakes before any adapter teardown, then let
+            # plugins stop their services and await every tracked task.
+            from gateway.wake import clear_wake_runtime
+            from hermes_cli.lifecycle import invoke_hook_async
+
+            clear_wake_runtime()
+            _plugin_tasks = getattr(self, "_plugin_lifecycle_tasks", None)
+            try:
+                await invoke_hook_async("gateway_shutdown", tasks=_plugin_tasks)
+            finally:
+                if _plugin_tasks is not None:
+                    await _plugin_tasks.cancel_and_wait()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):

@@ -187,6 +187,10 @@ VALID_HOOKS: Set[str] = {
     #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
+    # Gateway process lifecycle. Async callbacks are supported through
+    # invoke_hook_async and are isolated from one another.
+    "gateway_startup",
+    "gateway_shutdown",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
@@ -345,6 +349,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._ambient: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -382,6 +387,20 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
+
+    @property
+    def ambient(self) -> Any:
+        """Return the plugin-safe ambient-turn delivery service.
+
+        The service accepts only an explicit persisted ``SessionSource`` and
+        never exposes GatewayRunner, adapter registries, or request context.
+        """
+        if self._ambient is None:
+            from gateway.ambient_delivery import AmbientTurnService
+
+            plugin_id = self.manifest.key or self.manifest.name
+            self._ambient = AmbientTurnService(plugin_id)
+        return self._ambient
 
     # -- profile awareness --------------------------------------------------
 
@@ -1945,6 +1964,28 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke plugin hooks and await callback results when necessary."""
+        import inspect
+
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb in self._hooks.get(hook_name, []):
+            try:
+                ret = cb(**kwargs)
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                if ret is not None:
+                    results.append(ret)
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2071,6 +2112,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a plugin lifecycle hook and await async callbacks."""
+    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

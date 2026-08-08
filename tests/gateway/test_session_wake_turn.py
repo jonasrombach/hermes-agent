@@ -74,7 +74,37 @@ def test_internal_session_wake_controls_preserve_hidden_provenance():
     }
 
 
-def test_normal_turn_controls_remain_unchanged():
+
+def test_internal_ambient_controls_match_legacy_session_wake_without_plugin_leakage():
+    from gateway.run import _session_wake_hook_provenance, _turn_controls_from_metadata
+
+    metadata = {
+        "internal_ambient": True,
+        "plugin_id": "weather-plugin",
+        "delivery_id": "weather:42",
+        "coalesce_key": "plugin:weather-plugin:rain",
+        "event_kind": "weather.alert",
+        "source_label": "weather station",
+    }
+    controls = _turn_controls_from_metadata(metadata, internal=True)
+    assert controls["persist_user_display_kind"] == "hidden"
+    assert controls["skip_external_memory_sync"] is True
+    assert controls["persist_user_display_metadata"] == {
+        "synthetic": True,
+        "source": "ambient",
+        "delivery_id": "weather:42",
+        "coalesce_key": "plugin:weather-plugin:rain",
+    }
+    assert _session_wake_hook_provenance(metadata, internal=True) == {
+        "internal": True,
+        "synthetic": True,
+        "source": "ambient",
+        "event_kind": "weather.alert",
+        "delivery_id": "weather:42",
+        "coalesce_key": "plugin:weather-plugin:rain",
+        "source_label": "weather station",
+    }
+
     from gateway.run import _turn_controls_from_metadata
 
     assert _turn_controls_from_metadata(

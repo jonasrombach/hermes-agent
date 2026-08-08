@@ -33,11 +33,13 @@ def _make_adapter():
     return adapter
 
 
-def _event(text: str, *, wake_key: str | None = None) -> MessageEvent:
+def _event(
+    text: str, *, wake_key: str | None = None, ambient_marker: str = "session_wake"
+) -> MessageEvent:
     metadata = {}
     internal = wake_key is not None
     if wake_key is not None:
-        metadata = {"session_wake": True, "coalesce_key": wake_key}
+        metadata = {ambient_marker: True, "coalesce_key": wake_key}
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
@@ -61,6 +63,32 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
             await asyncio.sleep(0.005)
 
     await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambient_marker", ["session_wake", "internal_ambient"])
+async def test_trusted_ambient_markers_share_queue_priority(ambient_marker):
+    adapter = _make_adapter()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "active":
+            started.set()
+            await release.wait()
+        return ""
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("active"))
+    await started.wait()
+    await adapter.handle_message(
+        _event("ambient", wake_key="key", ambient_marker=ambient_marker)
+    )
+    await adapter.handle_message(_event("human"))
+    assert adapter._pending_messages[_session_key()].text == "human"
+    assert [e.text for e in adapter._session_wake_queues[_session_key()]] == ["ambient"]
+    release.set()
+    await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio

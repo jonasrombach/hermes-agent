@@ -5314,11 +5314,14 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _is_session_wake(event: MessageEvent) -> bool:
-        """Return whether an event is an internal session wake."""
+        """Return whether an event is a trusted internal ambient follow-up."""
         return bool(
             event.internal
             and isinstance(event.metadata, dict)
-            and event.metadata.get("session_wake") is True
+            and (
+                event.metadata.get("session_wake") is True
+                or event.metadata.get("internal_ambient") is True
+            )
         )
 
     def _queue_session_wake(self, session_key: str, event: MessageEvent) -> None:

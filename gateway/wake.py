@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,37 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 # turns on one session are last-writer-wins — but it DOES enforce a global
 # max_concurrent_runs cap via HTTP 429, which is worth waiting out.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
+
+# One process-wide runtime registry backs every internal wake producer. Cron
+# already calls ``deliver_wake`` with an adapter it owns; plugins resolve a
+# trusted SessionSource through this registry without receiving the runner,
+# adapter maps, or event loop themselves.
+_WAKE_RUNTIME_LOCK = threading.RLock()
+_WAKE_RUNTIME: tuple[Any, asyncio.AbstractEventLoop] | None = None
+
+
+def set_wake_runtime(runner: Any, loop: asyncio.AbstractEventLoop) -> None:
+    """Publish the live gateway runner after its adapters are connected."""
+    if runner is None:
+        raise RuntimeError("wake runtime requires a gateway runner")
+    if loop is None or loop.is_closed() or not loop.is_running():
+        raise RuntimeError("wake runtime requires a running event loop")
+    global _WAKE_RUNTIME
+    with _WAKE_RUNTIME_LOCK:
+        _WAKE_RUNTIME = (runner, loop)
+
+
+def clear_wake_runtime() -> None:
+    """Remove runtime access before plugin shutdown and adapter teardown."""
+    global _WAKE_RUNTIME
+    with _WAKE_RUNTIME_LOCK:
+        _WAKE_RUNTIME = None
+
+
+def get_wake_runtime() -> tuple[Any, asyncio.AbstractEventLoop] | None:
+    """Return an atomic snapshot of the shared wake runtime, if available."""
+    with _WAKE_RUNTIME_LOCK:
+        return _WAKE_RUNTIME
 
 
 def adapter_supports_push(adapter: Any) -> bool:

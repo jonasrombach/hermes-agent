@@ -5337,6 +5337,22 @@ class BasePlatformAdapter(ABC):
                     return
         queue.append(event)
 
+    @staticmethod
+    def _session_wake_expired(event: MessageEvent) -> bool:
+        """Fail closed when a queued wake's optional ISO-8601 TTL has elapsed."""
+        raw = event.metadata.get("expires_at") if isinstance(event.metadata, dict) else None
+        if not raw:
+            return False
+        if not isinstance(raw, str):
+            return True
+        try:
+            expires = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                return True
+            return expires.timestamp() <= time.time()
+        except (TypeError, ValueError, OverflowError):
+            return True
+
     def _pop_next_follow_up(self, session_key: str) -> Optional[MessageEvent]:
         """Pop a human follow-up first, then the oldest queued session wake."""
         pending = self._pending_messages.pop(session_key, None)
@@ -5346,10 +5362,15 @@ class BasePlatformAdapter(ABC):
         if not queue:
             self._session_wake_queues.pop(session_key, None)
             return None
-        event = queue.pop(0)
-        if not queue:
-            self._session_wake_queues.pop(session_key, None)
-        return event
+        while queue:
+            event = queue.pop(0)
+            if self._session_wake_expired(event):
+                continue
+            if not queue:
+                self._session_wake_queues.pop(session_key, None)
+            return event
+        self._session_wake_queues.pop(session_key, None)
+        return None
 
     def _restore_follow_up(self, session_key: str, event: MessageEvent) -> None:
         """Restore a popped follow-up at the front of its original queue."""

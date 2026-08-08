@@ -14,7 +14,7 @@ import re
 from typing import Any, Mapping
 
 from gateway.session import SessionSource
-from gateway.wake import deliver_wake, get_wake_runtime
+from gateway.wake import adapter_supports_push, deliver_wake, get_wake_runtime
 
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_ID_LENGTH = 160
@@ -133,6 +133,10 @@ class AmbientTurnService:
         if adapter is None:
             raise RuntimeError(
                 f"Gateway adapter is unavailable for {session_source.platform.value}"
+            )
+        if not adapter_supports_push(adapter):
+            raise RuntimeError(
+                "Ambient plugin delivery requires a push-capable messaging session origin"
             )
         metadata: dict[str, Any] = {
             "internal_ambient": True,

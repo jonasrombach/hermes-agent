@@ -11326,12 +11326,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # plugin ambient producers. Plugins only receive the validating
         # AmbientTurnService facade, never this runner or its adapter maps.
         from gateway.wake import set_wake_runtime
-        from hermes_cli.lifecycle import invoke_hook_async
+        from hermes_cli.lifecycle import GatewayLifecycleTasks, invoke_hook_async
 
+        _plugin_tasks = getattr(self, "_plugin_lifecycle_tasks", None)
+        if _plugin_tasks is None or _plugin_tasks.closed:
+            _plugin_tasks = GatewayLifecycleTasks()
+            self._plugin_lifecycle_tasks = _plugin_tasks
         set_wake_runtime(self, asyncio.get_running_loop())
         await invoke_hook_async(
             "gateway_startup",
-            tasks=self._plugin_lifecycle_tasks,
+            tasks=_plugin_tasks,
         )
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop

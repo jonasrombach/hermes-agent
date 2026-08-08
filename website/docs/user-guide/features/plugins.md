@@ -103,6 +103,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user")` — see [Injecting Messages](#injecting-messages) |
+| Deliver a gateway ambient turn | `await ctx.ambient.deliver(source=..., text=..., event_kind=..., delivery_id=...)` — explicit push-capable messaging origin only; uses the same session queue as internal wakes |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -201,6 +202,8 @@ Plugins can register callbacks for these lifecycle events. See the **[Event Hook
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`, `/clear`, idle rotation) |
 | [`subagent_stop`](/user-guide/features/hooks#subagent_stop) | Once per child after `delegate_task` finishes |
 | [`pre_gateway_dispatch`](/user-guide/features/hooks#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch. Return `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow. |
+| `gateway_startup` | Gateway adapters are initialized and the ambient-turn runtime is available; receives `tasks` for owned background services |
+| `gateway_shutdown` | Gateway begins shutdown, before owned plugin tasks are cancelled and awaited |
 
 ## Plugin types
 

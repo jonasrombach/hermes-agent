@@ -66,3 +66,31 @@ async def test_gateway_lifecycle_tasks_cancel_and_await_services():
 
     assert "gateway_startup" in VALID_HOOKS
     assert "gateway_shutdown" in VALID_HOOKS
+
+
+@pytest.mark.asyncio
+async def test_gateway_lifecycle_tasks_reject_children_spawned_during_shutdown():
+    from hermes_cli.lifecycle import GatewayLifecycleTasks
+
+    tasks = GatewayLifecycleTasks()
+    child_started = asyncio.Event()
+
+    async def child():
+        child_started.set()
+        await asyncio.Event().wait()
+
+    async def parent():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            with pytest.raises(RuntimeError, match="closed"):
+                tasks.create_task(child())
+            raise
+
+    tasks.create_task(parent())
+    await asyncio.sleep(0)
+    await tasks.cancel_and_wait()
+
+    assert not child_started.is_set()
+    with pytest.raises(RuntimeError, match="closed"):
+        tasks.create_task(child())

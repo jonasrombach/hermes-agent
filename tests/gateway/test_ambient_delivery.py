@@ -188,3 +188,22 @@ def test_runtime_resolver_requires_a_real_session_source():
 
     with pytest.raises(ValueError, match="SessionSource"):
         resolve_ambient_adapter(object(), {Platform.TELEGRAM: object()})
+
+
+@pytest.mark.asyncio
+async def test_ambient_service_rejects_non_push_session_origins(source):
+    from gateway.ambient_delivery import AmbientTurnService
+    from gateway.wake import set_wake_runtime
+
+    class _NonPushAdapter:
+        supports_async_delivery = False
+
+    set_wake_runtime(_Runner(_NonPushAdapter()), asyncio.get_running_loop())
+
+    with pytest.raises(RuntimeError, match="push-capable messaging"):
+        await AmbientTurnService("plugin").deliver(
+            source=source,
+            text="event",
+            event_kind="sync",
+            delivery_id="non-push",
+        )

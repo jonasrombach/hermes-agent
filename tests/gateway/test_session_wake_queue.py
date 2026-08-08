@@ -1,6 +1,7 @@
 """Behavior tests for session-wake follow-up turn boundaries."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -34,12 +35,18 @@ def _make_adapter():
 
 
 def _event(
-    text: str, *, wake_key: str | None = None, ambient_marker: str = "session_wake"
+    text: str,
+    *,
+    wake_key: str | None = None,
+    ambient_marker: str = "session_wake",
+    expires_at: str | None = None,
 ) -> MessageEvent:
     metadata = {}
     internal = wake_key is not None
     if wake_key is not None:
         metadata = {ambient_marker: True, "coalesce_key": wake_key}
+        if expires_at is not None:
+            metadata["expires_at"] = expires_at
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
@@ -247,6 +254,40 @@ async def test_idle_session_wake_starts_immediately():
     await adapter.handle_message(_event("wake", wake_key="heartbeat"))
     await _wait_until(lambda: processed == ["wake"])
 
+    assert _session_key() not in adapter._session_wake_queues
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_expired_ambient_wake_is_dropped_when_dequeued():
+    adapter = _make_adapter()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    processed = []
+
+    async def handler(event):
+        processed.append(event.text)
+        if event.text == "active":
+            started.set()
+            await release.wait()
+        return ""
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("active"))
+    await started.wait()
+    await adapter.handle_message(
+        _event(
+            "expired-while-queued",
+            wake_key="ambient",
+            ambient_marker="internal_ambient",
+            expires_at=(datetime.now(timezone.utc) + timedelta(milliseconds=20)).isoformat(),
+        )
+    )
+    await asyncio.sleep(0.05)
+    release.set()
+    await _wait_until(lambda: _session_key() not in adapter._active_sessions)
+
+    assert processed == ["active"]
     assert _session_key() not in adapter._session_wake_queues
     await adapter.cancel_background_tasks()
 

@@ -611,6 +611,8 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
+| `gateway_startup` | Gateway adapters are initialized | `tasks: GatewayLifecycleTasks` | ignored; sync and async callbacks supported |
+| `gateway_shutdown` | Gateway begins shutdown | `tasks: GatewayLifecycleTasks` | ignored; sync and async callbacks supported |
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
@@ -618,6 +620,50 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive.
 
 All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
+
+### Gateway-owned services and ambient turns
+
+Long-running gateway plugins should start services from `gateway_startup` with
+the supplied task owner. Hermes cancels and awaits these tasks during shutdown;
+the owner rejects tasks created after shutdown begins.
+
+```python
+import asyncio
+
+
+def register(ctx):
+    stop = asyncio.Event()
+
+    async def poll_events():
+        while not stop.is_set():
+            event = await next_event()
+            await ctx.ambient.deliver(
+                source=CONFIGURED_SESSION_SOURCE,
+                text=render_bounded_event(event),
+                event_kind="example.update",
+                delivery_id=event.id,
+                coalesce_key="example:updates",
+                expires_at=event.expires_at,
+            )
+
+    async def startup(tasks, **_kwargs):
+        tasks.create_task(poll_events(), name="example-event-poller")
+
+    async def shutdown(**_kwargs):
+        stop.set()
+
+    ctx.register_hook("gateway_startup", startup)
+    ctx.register_hook("gateway_shutdown", shutdown)
+```
+
+`ctx.ambient` accepts an explicit `SessionSource` mapping for a push-capable
+messaging adapter. The source must come from trusted local configuration, never
+from the external event. Delivery uses the existing internal wake queue: an idle
+session starts immediately, a busy session queues a separate hidden follow-up,
+matching coalesce keys replace unstarted events, and expired queued events are
+dropped. Synthetic input stays hidden in transcript displays and is excluded
+from automatic external-memory sync. Delivery errors are raised so the plugin
+can retain its cursor and retry.
 
 The kanban lifecycle hooks fire **after** the board DB change commits, so a callback always sees durable state and can never hold the SQLite write lock. Because kanban workers run as separate `hermes -p <profile> chat -q` subprocesses, `kanban_task_claimed` fires in the **dispatcher** process while `kanban_task_completed` / `kanban_task_blocked` fire in the **worker** process — hook in the dispatcher to observe every transition centrally, or in the worker for per-task in-session context.
 

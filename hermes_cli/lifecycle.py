@@ -15,9 +15,17 @@ class GatewayLifecycleTasks:
 
     def __init__(self) -> None:
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def create_task(self, awaitable: Coroutine[Any, Any, Any], *, name: str | None = None) -> asyncio.Task[Any]:
         """Start and track one service task on the current gateway loop."""
+        if self._closed:
+            awaitable.close()
+            raise RuntimeError("Gateway lifecycle task owner is closed")
         task = asyncio.create_task(awaitable, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -25,11 +33,14 @@ class GatewayLifecycleTasks:
 
     async def cancel_and_wait(self) -> None:
         """Cancel all tracked services and wait until their cleanup completes."""
+        self._closed = True
         current = asyncio.current_task()
-        tasks = [task for task in self._tasks if task is not current and not task.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
+        while True:
+            tasks = [task for task in self._tasks if task is not current and not task.done()]
+            if not tasks:
+                break
+            for task in tasks:
+                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
 

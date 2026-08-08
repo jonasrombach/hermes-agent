@@ -71,6 +71,34 @@ class AmbientTurnService:
     def __init__(self, plugin_id: str):
         self._plugin_id = _bounded_string(plugin_id, "plugin_id", required=True)
 
+    def ready(self, source: Mapping[str, Any] | SessionSource | None = None) -> bool:
+        """Return whether the host can currently accept an ambient delivery.
+
+        With a source, readiness also requires its push-capable adapter. The
+        check is side-effect free so a subscriber can wait before claiming a
+        durable external event.
+        """
+        runtime = get_wake_runtime()
+        if runtime is None:
+            return False
+        runner, loop = runtime
+        if getattr(runner, "_draining", False) or not getattr(runner, "_running", False):
+            return False
+        if getattr(loop, "is_closed", lambda: True)() or not getattr(loop, "is_running", lambda: False)():
+            return False
+        if source is None:
+            return True
+        try:
+            session_source = source if isinstance(source, SessionSource) else SessionSource.from_dict(dict(source))
+            adapter = resolve_ambient_adapter(
+                session_source,
+                getattr(runner, "adapters", {}) or {},
+                profile_adapters=getattr(runner, "_profile_adapters", {}) or {},
+            )
+        except Exception:
+            return False
+        return adapter is not None and adapter_supports_push(adapter)
+
     async def deliver(
         self,
         *,

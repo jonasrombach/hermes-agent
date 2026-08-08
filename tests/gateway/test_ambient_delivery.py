@@ -191,6 +191,24 @@ def test_runtime_resolver_requires_a_real_session_source():
 
 
 @pytest.mark.asyncio
+async def test_ambient_service_readiness_tracks_live_gateway_runtime():
+    from gateway.ambient_delivery import AmbientTurnService
+    from gateway.wake import clear_wake_runtime, set_wake_runtime
+
+    service = AmbientTurnService("plugin")
+    assert service.ready() is False
+
+    runner = _Runner(object())
+    set_wake_runtime(runner, asyncio.get_running_loop())
+    assert service.ready() is True
+
+    runner._draining = True
+    assert service.ready() is False
+    clear_wake_runtime()
+    assert service.ready() is False
+
+
+@pytest.mark.asyncio
 async def test_ambient_service_rejects_non_push_session_origins(source):
     from gateway.ambient_delivery import AmbientTurnService
     from gateway.wake import set_wake_runtime

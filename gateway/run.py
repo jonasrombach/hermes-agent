@@ -5774,6 +5774,8 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if ctx.private_turn:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -19923,6 +19925,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        private: bool = False,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
@@ -19933,6 +19936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
             content=content,
             plugin_id=plugin_id,
+            private=private,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -19991,6 +19995,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        private: bool = False,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
@@ -20003,6 +20008,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         source = dataclasses.replace(entry.origin)
+        if private:
+            setattr(source, "_hermes_private_turn", True)
         try:
             if not self._is_user_authorized(
                 source,
@@ -20041,6 +20048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "gateway_session_key": session_key,
                 "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
+                **({"hermes_private_turn": True} if private else {}),
             },
         )
         await adapter.handle_message(event)
@@ -29693,6 +29701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        private_turn = bool(getattr(source, "_hermes_private_turn", False))
 
         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
             user_config, source, platform_key
@@ -29750,6 +29759,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if private_turn:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -29812,6 +29823,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
+        if private_turn:
+            _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -29827,6 +29840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
+            and not private_turn
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
@@ -29838,6 +29852,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
+        if private_turn:
+            _thinking_enabled = False
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack
@@ -29847,6 +29863,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _native_slack_task_cards = False
         if (
             source.platform == Platform.SLACK
+            and not private_turn
             and _progress_adapter_for_native is not None
             and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
         ):
@@ -29924,6 +29941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         turn_ctx = TurnContext(
             source=source,
+            private_turn=private_turn,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
@@ -30167,7 +30185,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        _status_adapter = None if private_turn else self._adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -31293,6 +31311,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        if (
+            private_turn
+            and isinstance(response, dict)
+            and not response.get("response_transformed")
+        ):
+            response["final_response"] = "NO_REPLY"
+            response["already_sent"] = False
+            response["response_previewed"] = False
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

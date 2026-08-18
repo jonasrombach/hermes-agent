@@ -183,6 +183,27 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
 
 
 @pytest.mark.asyncio
+async def test_private_dispatch_marks_only_the_copied_source_and_event():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        content="private background turn",
+        plugin_id="notify-plugin",
+        private=True,
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["hermes_private_turn"] is True
+    assert event.source is not entry.origin
+    assert getattr(event.source, "_hermes_private_turn") is True
+    assert not hasattr(entry.origin, "_hermes_private_turn")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entry", "with_adapter"),
     [
@@ -353,6 +374,7 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
         session_key="agent:main:telegram:dm:42",
         content="wake up",
         plugin_id="notify-plugin",
+        private=False,
     )
 
 

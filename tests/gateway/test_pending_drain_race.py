@@ -148,6 +148,24 @@ async def test_pending_drain_keeps_active_session_guard_live():
 
 
 @pytest.mark.asyncio
+async def test_private_plugin_turn_never_starts_typing_indicator():
+    adapter = _make_adapter()
+    adapter.send_typing = AsyncMock()
+
+    async def _slow_private_handler(_event):
+        await asyncio.sleep(0.02)
+        return None
+
+    adapter._message_handler = _slow_private_handler
+    event = _make_event(text="private wake")
+    event.metadata["hermes_private_turn"] = True
+
+    await adapter._process_message_background(event, _sk())
+
+    adapter.send_typing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_finally_cleanup_drains_late_arrival_pending():
     """Fix for R6: if a message lands in _pending_messages during the
     finally-block cleanup awaits, the finally must spawn a drain task

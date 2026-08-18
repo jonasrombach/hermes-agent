@@ -229,6 +229,42 @@ class FakeAgent:
         }
 
 
+class PrivateLeakyAgent:
+    """Attempts every user-visible progress path during a private turn."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        progress = getattr(self, "tool_progress_callback", None)
+        stream = getattr(self, "stream_delta_callback", None)
+        interim = getattr(self, "interim_assistant_callback", None)
+        status = getattr(self, "status_callback", None)
+        if progress:
+            progress("tool.started", "web_search", "secret query")
+        if stream:
+            stream("streamed secret")
+        if interim:
+            interim("interim secret")
+        if status:
+            status("status", "status secret")
+        return {
+            "final_response": "unmarked private response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class PrivateTransformedAgent(PrivateLeakyAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "deliberate notification",
+            "response_transformed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class NativeTaskCardAdapter(ProgressCaptureAdapter):
     def __init__(self, platform=Platform.SLACK):
         super().__init__(platform=platform)
@@ -1006,6 +1042,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    private_turn=False,
 ):
     if config_data:
         import yaml
@@ -1035,6 +1072,8 @@ async def _run_with_agent(
         user_id=user_id,
         scope_id=scope_id,
     )
+    if private_turn:
+        setattr(source, "_hermes_private_turn", True)
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
@@ -1055,6 +1094,47 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_private_turn_suppresses_progress_streaming_and_untransformed_final(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateLeakyAgent,
+        session_id="sess-private-silent",
+        private_turn=True,
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+                "thinking_progress": True,
+            },
+            "streaming": {"enabled": True, "buffer_threshold": 1},
+        },
+    )
+
+    assert result["final_response"] == "NO_REPLY"
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_private_turn_allows_explicit_transformed_notification(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateTransformedAgent,
+        session_id="sess-private-notify",
+        private_turn=True,
+        config_data={"streaming": {"enabled": True, "buffer_threshold": 1}},
+    )
+
+    assert result["final_response"] == "deliberate notification"
+    assert adapter.sent == []
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio

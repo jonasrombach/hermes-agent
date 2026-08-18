@@ -2049,6 +2049,7 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        private: bool = False,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -2060,6 +2061,9 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        ``private=True`` requests a presentation-silent turn: the gateway hides
+        typing, progress, streaming, and any final response that was not
+        deliberately transformed by a trusted plugin hook.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
 
@@ -2103,6 +2107,7 @@ class PluginContext:
                     session_key=session_key,
                     content=msg,
                     plugin_id=plugin_id,
+                    private=bool(private),
                 )
             )
         except Exception:

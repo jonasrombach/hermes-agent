@@ -52,6 +52,17 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
     assert cli._pending_input.empty()
 
 
+def test_gateway_session_idle_probe_is_available_to_plugins():
+    context, manager = _context()
+    owner = object()
+    manager.set_gateway_session_idle_checker(owner, lambda key: key == "idle")
+
+    assert context.is_gateway_session_idle("idle") is True
+    assert context.is_gateway_session_idle("busy") is False
+    manager.clear_gateway_message_injector(owner)
+    assert context.is_gateway_session_idle("idle") is None
+
+
 def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,

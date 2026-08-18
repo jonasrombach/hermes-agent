@@ -2122,6 +2122,17 @@ class PluginContext:
             )
             return False
 
+    def is_gateway_session_idle(self, session_key: str) -> bool | None:
+        """Return live gateway idleness for a bound session, when available."""
+        checker = self._manager._gateway_session_idle_checker
+        if checker is None:
+            return None
+        try:
+            return bool(checker[1](session_key))
+        except Exception:
+            logger.debug("gateway session idle check failed", exc_info=True)
+            return None
+
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
         try:
@@ -3766,6 +3777,7 @@ class PluginManager:
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._gateway_session_idle_checker: tuple[object, Callable[[str], bool]] | None = None
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -4219,11 +4231,22 @@ class PluginManager:
         """Publish a live gateway injector and its lifecycle owner."""
         self._gateway_message_injector = (owner, injector)
 
+    def set_gateway_session_idle_checker(
+        self,
+        owner: object,
+        checker: Callable[[str], bool],
+    ) -> None:
+        """Publish a live gateway session-idleness probe for plugins."""
+        self._gateway_session_idle_checker = (owner, checker)
+
     def clear_gateway_message_injector(self, owner: object) -> None:
         """Clear the injector only when it still belongs to ``owner``."""
         registered = self._gateway_message_injector
         if registered is not None and registered[0] is owner:
             self._gateway_message_injector = None
+        idle_checker = self._gateway_session_idle_checker
+        if idle_checker is not None and idle_checker[0] is owner:
+            self._gateway_session_idle_checker = None
 
     def inject_gateway_message(self, **kwargs: Any) -> bool:
         """Submit a plugin-triggered turn to the live gateway."""

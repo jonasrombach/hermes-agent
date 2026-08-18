@@ -19914,10 +19914,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Publish this live gateway's plugin message scheduler."""
         from hermes_cli.plugins import get_plugin_manager
 
-        get_plugin_manager().set_gateway_message_injector(
+        manager = get_plugin_manager()
+        manager.set_gateway_message_injector(
             self,
             self._schedule_plugin_message_injection,
         )
+        manager.set_gateway_session_idle_checker(self, self._is_plugin_session_idle)
+
+    def _is_plugin_session_idle(self, session_key: str) -> bool:
+        """Whether a plugin may safely inject a new turn into *session_key*."""
+        return bool(session_key) and session_key not in getattr(self, "_running_agents", {})
 
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""

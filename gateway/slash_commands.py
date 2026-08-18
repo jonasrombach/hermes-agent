@@ -25,10 +25,9 @@ import re
 import shlex
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
-from zoneinfo import ZoneInfo
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -68,130 +67,6 @@ def _int_value(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
-
-
-_ROCKY_WEEKDAYS = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
-_ROCKY_TIMEZONE = ZoneInfo("Europe/Berlin")
-
-
-def _format_rocky_heartbeat_time(
-    value: Any,
-    *,
-    relative: bool = True,
-    now: Optional[datetime] = None,
-) -> str:
-    """Format an ISO heartbeat timestamp in Jonas' local time."""
-    if not value:
-        return "nicht geplant"
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        local = parsed.astimezone(_ROCKY_TIMEZONE)
-    except (TypeError, ValueError):
-        return str(value)
-
-    rendered = (
-        f"{_ROCKY_WEEKDAYS[local.weekday()]}, "
-        f"{local:%d.%m.%Y} · {local:%H:%M} {local.tzname() or 'local'}"
-    )
-    if not relative:
-        return rendered
-
-    reference = (now or datetime.now(timezone.utc)).astimezone(_ROCKY_TIMEZONE)
-    delta_seconds = (local - reference).total_seconds()
-    absolute_seconds = abs(delta_seconds)
-    if absolute_seconds < 30:
-        relation = "jetzt"
-    else:
-        minutes = max(1, int((absolute_seconds + 30) // 60))
-        if minutes < 60:
-            amount = f"{minutes} Min."
-        else:
-            hours, remainder = divmod(minutes, 60)
-            amount = f"{hours} Std."
-            if remainder:
-                amount += f" {remainder} Min."
-        relation = f"in {amount}" if delta_seconds > 0 else f"vor {amount}"
-    return f"{rendered} ({relation})"
-
-
-def _rocky_heartbeat_status(args: str) -> Optional[str]:
-    """Render Rocky's adaptive plugin state for /heartbeat inspection."""
-    command = (args or "status").strip().lower()
-    if command not in {"status", "last", "history"}:
-        return None
-    try:
-        from hermes_cli.plugins import PluginState
-
-        state = PluginState("rocky-heartbeat").get("heartbeat", {})
-    except Exception:
-        logger.debug("Could not read Rocky heartbeat state", exc_info=True)
-        return None
-    if not isinstance(state, dict) or not state:
-        return None
-
-    history = [item for item in (state.get("history") or []) if isinstance(item, dict)]
-    if command == "last":
-        if not history:
-            return "🖤 Noch kein Heartbeat-Lauf abgeschlossen."
-        item = history[-1]
-        decision = "Jonas benachrichtigt" if item.get("notify") else "still"
-        lines = [
-            "🖤 **Letzter Heartbeat**",
-            "",
-            "**Abgeschlossen**",
-            _format_rocky_heartbeat_time(item.get("completed_at")),
-            "",
-            "**Entscheidung**",
-            decision,
-            "",
-            "**Nächster Lauf**",
-            _format_rocky_heartbeat_time(item.get("next_at")),
-            "",
-            "**Prüfprotokoll**",
-            str(item.get("note") or "(keine Notiz)"),
-        ]
-        if item.get("notify") and item.get("message"):
-            lines.extend(["", "**Gesendete Nachricht**", str(item["message"])])
-        return "\n".join(lines)
-
-    if command == "history":
-        if not history:
-            return "🖤 Noch kein Heartbeat-Lauf abgeschlossen."
-        lines = ["🖤 **Heartbeat-Verlauf**", ""]
-        recent = history[-10:][::-1]
-        for index, item in enumerate(recent, start=1):
-            decision = "Jonas benachrichtigt" if item.get("notify") else "still"
-            note = str(item.get("note") or "").replace("\n", " ")
-            if len(note) > 320:
-                note = note[:317] + "..."
-            if index > 1:
-                lines.extend(["", "—", ""])
-            lines.extend(
-                [
-                    f"**{index} · {_format_rocky_heartbeat_time(item.get('completed_at'), relative=False)}**",
-                    f"• Entscheidung: {decision}",
-                    f"• Nächster Lauf: {_format_rocky_heartbeat_time(item.get('next_at'), relative=False)}",
-                    "",
-                    note or "(keine Notiz)",
-                ]
-            )
-        return "\n".join(lines)
-
-    enabled = bool(state.get("enabled"))
-    inflight = state.get("inflight") or {}
-    status = "Läuft gerade" if inflight else ("Aktiv" if enabled else "Pausiert")
-    return "\n".join(
-        [
-            "🖤 Rocky Heartbeat",
-            f"Status: {status}",
-            f"Nächster Lauf: {_format_rocky_heartbeat_time(state.get('next_at')) if state.get('next_at') else ('nach diesem Lauf' if inflight else 'nicht geplant')}",
-            f"Letzter Lauf: {_format_rocky_heartbeat_time(state.get('last_completed_at')) if state.get('last_completed_at') else 'noch keiner'}",
-            f"Runs: {int(state.get('runs_completed') or 0)}",
-            "Details: /heartbeat last · /heartbeat history",
-        ]
-    )
 
 
 def _model_switch_skew_guard() -> Optional[str]:
@@ -3059,10 +2934,6 @@ class GatewaySlashCommandsMixin:
 
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
-
-        adaptive_status = _rocky_heartbeat_status(lower)
-        if adaptive_status is not None:
-            return adaptive_status
 
         mgr, session_entry = await self._get_heartbeat_manager_for_event(event)
         if mgr is None:

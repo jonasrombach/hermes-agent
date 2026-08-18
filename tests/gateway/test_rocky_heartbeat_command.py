@@ -50,8 +50,8 @@ async def test_heartbeat_status_prefers_rocky_adaptive_state(adaptive_state):
         SimpleNamespace(), Event("status")
     )
 
-    assert "Rocky heartbeat" in response
-    assert "2026-08-18" in response
+    assert "🖤 Rocky Heartbeat" in response
+    assert "Di., 18.08.2026 · 13:45 CEST" in response
     assert "Runs: 2" in response
 
 
@@ -62,5 +62,5 @@ async def test_heartbeat_last_shows_structured_audit_record(adaptive_state):
     )
 
     assert "Checked calendar and mail" in response
-    assert "Decision: silent" in response
-    assert "Next:" in response
+    assert "Entscheidung: still" in response
+    assert "Nächster Lauf:" in response

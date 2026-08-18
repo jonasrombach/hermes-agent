@@ -25,9 +25,10 @@ import re
 import shlex
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
+from zoneinfo import ZoneInfo
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -69,6 +70,52 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+_ROCKY_WEEKDAYS = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+_ROCKY_TIMEZONE = ZoneInfo("Europe/Berlin")
+
+
+def _format_rocky_heartbeat_time(
+    value: Any,
+    *,
+    relative: bool = True,
+    now: Optional[datetime] = None,
+) -> str:
+    """Format an ISO heartbeat timestamp in Jonas' local time."""
+    if not value:
+        return "nicht geplant"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        local = parsed.astimezone(_ROCKY_TIMEZONE)
+    except (TypeError, ValueError):
+        return str(value)
+
+    rendered = (
+        f"{_ROCKY_WEEKDAYS[local.weekday()]}, "
+        f"{local:%d.%m.%Y} · {local:%H:%M} {local.tzname() or 'local'}"
+    )
+    if not relative:
+        return rendered
+
+    reference = (now or datetime.now(timezone.utc)).astimezone(_ROCKY_TIMEZONE)
+    delta_seconds = (local - reference).total_seconds()
+    absolute_seconds = abs(delta_seconds)
+    if absolute_seconds < 30:
+        relation = "jetzt"
+    else:
+        minutes = max(1, int((absolute_seconds + 30) // 60))
+        if minutes < 60:
+            amount = f"{minutes} Min."
+        else:
+            hours, remainder = divmod(minutes, 60)
+            amount = f"{hours} Std."
+            if remainder:
+                amount += f" {remainder} Min."
+        relation = f"in {amount}" if delta_seconds > 0 else f"vor {amount}"
+    return f"{rendered} ({relation})"
+
+
 def _rocky_heartbeat_status(args: str) -> Optional[str]:
     """Render Rocky's adaptive plugin state for /heartbeat inspection."""
     command = (args or "status").strip().lower()
@@ -87,45 +134,48 @@ def _rocky_heartbeat_status(args: str) -> Optional[str]:
     history = [item for item in (state.get("history") or []) if isinstance(item, dict)]
     if command == "last":
         if not history:
-            return "♥ Rocky heartbeat has not completed a run yet."
+            return "🖤 Noch kein Heartbeat-Lauf abgeschlossen."
         item = history[-1]
-        decision = "contacted Jonas" if item.get("notify") else "silent"
+        decision = "Jonas benachrichtigt" if item.get("notify") else "still"
         lines = [
-            "♥ Rocky heartbeat — last run",
-            f"Completed: {item.get('completed_at') or 'unknown'}",
-            f"Decision: {decision}",
-            f"Next: {item.get('next_at') or 'not scheduled'}",
-            f"Audit: {item.get('note') or '(no audit note)'}",
+            "🖤 Letzter Heartbeat",
+            f"Abgeschlossen: {_format_rocky_heartbeat_time(item.get('completed_at'))}",
+            f"Entscheidung: {decision}",
+            f"Nächster Lauf: {_format_rocky_heartbeat_time(item.get('next_at'))}",
+            f"Prüfprotokoll: {item.get('note') or '(keine Notiz)'}",
         ]
         if item.get("notify") and item.get("message"):
-            lines.append(f"Message: {item['message']}")
+            lines.append(f"Nachricht: {item['message']}")
         return "\n".join(lines)
 
     if command == "history":
         if not history:
-            return "♥ Rocky heartbeat has not completed a run yet."
-        lines = ["♥ Rocky heartbeat — recent runs"]
+            return "🖤 Noch kein Heartbeat-Lauf abgeschlossen."
+        lines = ["🖤 Letzte Heartbeat-Läufe"]
         for item in history[-10:][::-1]:
-            decision = "contact" if item.get("notify") else "silent"
+            decision = "Kontakt" if item.get("notify") else "still"
             note = str(item.get("note") or "").replace("\n", " ")
             if len(note) > 180:
                 note = note[:177] + "..."
             lines.append(
-                f"• {item.get('completed_at') or 'unknown'} · {decision} · "
-                f"next {item.get('next_at') or '?'}\n  {note or '(no audit note)'}"
+                f"• {_format_rocky_heartbeat_time(item.get('completed_at'), relative=False)} · "
+                f"{decision}\n  Nächster Lauf: "
+                f"{_format_rocky_heartbeat_time(item.get('next_at'), relative=False)}\n"
+                f"  {note or '(keine Notiz)'}"
             )
         return "\n".join(lines)
 
     enabled = bool(state.get("enabled"))
     inflight = state.get("inflight") or {}
-    status = "running now" if inflight else ("active" if enabled else "paused")
+    status = "Läuft gerade" if inflight else ("Aktiv" if enabled else "Pausiert")
     return "\n".join(
         [
-            f"♥ Rocky heartbeat: {status}",
-            f"Next: {state.get('next_at') or ('after this run' if inflight else 'not scheduled')}",
-            f"Last: {state.get('last_completed_at') or 'never'}",
+            "🖤 Rocky Heartbeat",
+            f"Status: {status}",
+            f"Nächster Lauf: {_format_rocky_heartbeat_time(state.get('next_at')) if state.get('next_at') else ('nach diesem Lauf' if inflight else 'nicht geplant')}",
+            f"Letzter Lauf: {_format_rocky_heartbeat_time(state.get('last_completed_at')) if state.get('last_completed_at') else 'noch keiner'}",
             f"Runs: {int(state.get('runs_completed') or 0)}",
-            "Inspect: /heartbeat last · /heartbeat history",
+            "Details: /heartbeat last · /heartbeat history",
         ]
     )
 

@@ -793,6 +793,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        # The warmed result is only valid for the query that produced it.
+        # Without this key, the next turn can consume context recalled for the
+        # previous user message (and a fresh process has no first-turn recall).
+        self._prefetch_query = ""
 
         # Bank
         self._bank_mission = ""
@@ -1714,12 +1718,40 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if self._memory_mode == "tools" or not self._auto_recall:
+            return ""
+        if self._shutting_down.is_set():
+            return ""
+
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+
+        # queue_prefetch() is speculative: Hermes calls it after a completed
+        # turn, before the next user query is known. Reuse it only when the
+        # actual query matches. Otherwise recall the current query so first-turn
+        # and topic-changing prompts receive relevant context.
+        with self._prefetch_lock:
+            cache_matches = self._prefetch_query == query
+
+        if not cache_matches:
+            if self._prefetch_thread and self._prefetch_thread.is_alive():
+                logger.debug("Prefetch: waiting for stale background query to complete")
+                self._prefetch_thread.join(timeout=3.0)
+                if self._prefetch_thread.is_alive():
+                    logger.debug("Prefetch: stale background query still running; skipping current turn")
+                    return ""
+            self.queue_prefetch(query, session_id=session_id)
+
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
+            if self._prefetch_query == query:
+                result = self._prefetch_result
+                self._prefetch_result = ""
+                self._prefetch_query = ""
+            else:
+                result = ""
         if not result:
             logger.debug("Prefetch: no results available")
             return ""
@@ -1744,6 +1776,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
+
+        with self._prefetch_lock:
+            self._prefetch_query = query
+            self._prefetch_result = ""
 
         def _run():
             # Ensure the just-completed turn's retain is recall-visible on the
@@ -1778,7 +1814,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
                 if text:
                     with self._prefetch_lock:
-                        self._prefetch_result = text
+                        # A newer current-turn query may have superseded this
+                        # speculative request while it was in flight.
+                        if self._prefetch_query == query:
+                            self._prefetch_result = text
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 

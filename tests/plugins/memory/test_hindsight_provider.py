@@ -493,7 +493,43 @@ class TestToolHandlers:
 
 class TestPrefetch:
     def test_prefetch_returns_empty_when_no_result(self, provider):
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(results=[])
+        )
         assert provider.prefetch("test") == ""
+
+    def test_prefetch_recalls_current_query_on_cache_miss(self, provider):
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[SimpleNamespace(text="current-turn memory")]
+            )
+        )
+
+        result = provider.prefetch("current turn query")
+
+        assert "current-turn memory" in result
+        awaited = provider._client.arecall.await_args
+        assert awaited is not None
+        assert awaited.kwargs["query"] == "current turn query"
+
+    def test_prefetch_does_not_inject_stale_query_cache(self, provider):
+        async def _recall(**kwargs):
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory for {kwargs['query']}")]
+            )
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider.queue_prefetch("previous turn query")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        result = provider.prefetch("new turn query")
+
+        assert "memory for new turn query" in result
+        assert "memory for previous turn query" not in result
+        assert [call.kwargs["query"] for call in provider._client.arecall.await_args_list] == [
+            "previous turn query",
+            "new turn query",
+        ]
 
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):

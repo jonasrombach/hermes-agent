@@ -161,6 +161,10 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Fired by the gateway after adapters and plugin message injection are live.
+    # Synchronous callbacks may use ctx.spawn_task() here because the gateway
+    # asyncio loop is running. Kwargs: gateway.
+    "gateway_ready",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -2061,8 +2065,8 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
-        ``private=True`` requests a presentation-silent turn: the gateway hides
-        typing, progress, streaming, and any final response that was not
+        ``private=True`` requests a presentation-quiet turn: the gateway hides
+        progress, streaming, and any final response that was not
         deliberately transformed by a trusted plugin hook.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.

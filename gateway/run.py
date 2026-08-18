@@ -13925,6 +13925,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._install_plugin_message_injector()
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_plugin_hook
+
+            _invoke_plugin_hook("gateway_ready", gateway=self)
+        except Exception:
+            logger.debug("Plugin gateway_ready hook failed", exc_info=True)
         self._update_runtime_status("running")
 
         try:

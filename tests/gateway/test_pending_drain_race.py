@@ -148,7 +148,7 @@ async def test_pending_drain_keeps_active_session_guard_live():
 
 
 @pytest.mark.asyncio
-async def test_private_plugin_turn_never_starts_typing_indicator():
+async def test_private_plugin_turn_keeps_typing_indicator_visible():
     adapter = _make_adapter()
     adapter.send_typing = AsyncMock()
 
@@ -162,7 +162,7 @@ async def test_private_plugin_turn_never_starts_typing_indicator():
 
     await adapter._process_message_background(event, _sk())
 
-    adapter.send_typing.assert_not_awaited()
+    adapter.send_typing.assert_awaited()
 
 
 @pytest.mark.asyncio

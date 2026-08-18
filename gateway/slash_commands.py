@@ -69,6 +69,67 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+def _rocky_heartbeat_status(args: str) -> Optional[str]:
+    """Render Rocky's adaptive plugin state for /heartbeat inspection."""
+    command = (args or "status").strip().lower()
+    if command not in {"status", "last", "history"}:
+        return None
+    try:
+        from hermes_cli.plugins import PluginState
+
+        state = PluginState("rocky-heartbeat").get("heartbeat", {})
+    except Exception:
+        logger.debug("Could not read Rocky heartbeat state", exc_info=True)
+        return None
+    if not isinstance(state, dict) or not state:
+        return None
+
+    history = [item for item in (state.get("history") or []) if isinstance(item, dict)]
+    if command == "last":
+        if not history:
+            return "♥ Rocky heartbeat has not completed a run yet."
+        item = history[-1]
+        decision = "contacted Jonas" if item.get("notify") else "silent"
+        lines = [
+            "♥ Rocky heartbeat — last run",
+            f"Completed: {item.get('completed_at') or 'unknown'}",
+            f"Decision: {decision}",
+            f"Next: {item.get('next_at') or 'not scheduled'}",
+            f"Audit: {item.get('note') or '(no audit note)'}",
+        ]
+        if item.get("notify") and item.get("message"):
+            lines.append(f"Message: {item['message']}")
+        return "\n".join(lines)
+
+    if command == "history":
+        if not history:
+            return "♥ Rocky heartbeat has not completed a run yet."
+        lines = ["♥ Rocky heartbeat — recent runs"]
+        for item in history[-10:][::-1]:
+            decision = "contact" if item.get("notify") else "silent"
+            note = str(item.get("note") or "").replace("\n", " ")
+            if len(note) > 180:
+                note = note[:177] + "..."
+            lines.append(
+                f"• {item.get('completed_at') or 'unknown'} · {decision} · "
+                f"next {item.get('next_at') or '?'}\n  {note or '(no audit note)'}"
+            )
+        return "\n".join(lines)
+
+    enabled = bool(state.get("enabled"))
+    inflight = state.get("inflight") or {}
+    status = "running now" if inflight else ("active" if enabled else "paused")
+    return "\n".join(
+        [
+            f"♥ Rocky heartbeat: {status}",
+            f"Next: {state.get('next_at') or ('after this run' if inflight else 'not scheduled')}",
+            f"Last: {state.get('last_completed_at') or 'never'}",
+            f"Runs: {int(state.get('runs_completed') or 0)}",
+            "Inspect: /heartbeat last · /heartbeat history",
+        ]
+    )
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -2934,6 +2995,10 @@ class GatewaySlashCommandsMixin:
 
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
+
+        adaptive_status = _rocky_heartbeat_status(lower)
+        if adaptive_status is not None:
+            return adaptive_status
 
         mgr, session_entry = await self._get_heartbeat_manager_for_event(event)
         if mgr is None:

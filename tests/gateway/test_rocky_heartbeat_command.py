@@ -62,5 +62,33 @@ async def test_heartbeat_last_shows_structured_audit_record(adaptive_state):
     )
 
     assert "Checked calendar and mail" in response
-    assert "Entscheidung: still" in response
-    assert "Nächster Lauf:" in response
+    assert "**Entscheidung**\nstill" in response
+    assert "**Nächster Lauf**\n" in response
+    assert response.startswith("🖤 **Letzter Heartbeat**\n\n")
+    assert "\n\n**Prüfprotokoll**\n" in response
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_history_uses_separated_readable_entries(adaptive_state):
+    response = await GatewayRunner._handle_heartbeat_command(
+        SimpleNamespace(), Event("history")
+    )
+
+    assert response.startswith("🖤 **Heartbeat-Verlauf**\n\n")
+    assert "**1 · Di., 18.08.2026 · 13:00 CEST**" in response
+    assert "\n• Entscheidung: still\n• Nächster Lauf:" in response
+    assert "\n\nChecked calendar and mail" in response
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_last_separates_sent_message(adaptive_state):
+    state = adaptive_state.get("heartbeat")
+    state["history"][0]["notify"] = True
+    state["history"][0]["message"] = "Visible message"
+    adaptive_state.set("heartbeat", state)
+
+    response = await GatewayRunner._handle_heartbeat_command(
+        SimpleNamespace(), Event("last")
+    )
+
+    assert "\n\n**Gesendete Nachricht**\nVisible message" in response

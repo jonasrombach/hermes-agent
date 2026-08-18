@@ -138,30 +138,44 @@ def _rocky_heartbeat_status(args: str) -> Optional[str]:
         item = history[-1]
         decision = "Jonas benachrichtigt" if item.get("notify") else "still"
         lines = [
-            "🖤 Letzter Heartbeat",
-            f"Abgeschlossen: {_format_rocky_heartbeat_time(item.get('completed_at'))}",
-            f"Entscheidung: {decision}",
-            f"Nächster Lauf: {_format_rocky_heartbeat_time(item.get('next_at'))}",
-            f"Prüfprotokoll: {item.get('note') or '(keine Notiz)'}",
+            "🖤 **Letzter Heartbeat**",
+            "",
+            "**Abgeschlossen**",
+            _format_rocky_heartbeat_time(item.get("completed_at")),
+            "",
+            "**Entscheidung**",
+            decision,
+            "",
+            "**Nächster Lauf**",
+            _format_rocky_heartbeat_time(item.get("next_at")),
+            "",
+            "**Prüfprotokoll**",
+            str(item.get("note") or "(keine Notiz)"),
         ]
         if item.get("notify") and item.get("message"):
-            lines.append(f"Nachricht: {item['message']}")
+            lines.extend(["", "**Gesendete Nachricht**", str(item["message"])])
         return "\n".join(lines)
 
     if command == "history":
         if not history:
             return "🖤 Noch kein Heartbeat-Lauf abgeschlossen."
-        lines = ["🖤 Letzte Heartbeat-Läufe"]
-        for item in history[-10:][::-1]:
-            decision = "Kontakt" if item.get("notify") else "still"
+        lines = ["🖤 **Heartbeat-Verlauf**", ""]
+        recent = history[-10:][::-1]
+        for index, item in enumerate(recent, start=1):
+            decision = "Jonas benachrichtigt" if item.get("notify") else "still"
             note = str(item.get("note") or "").replace("\n", " ")
-            if len(note) > 180:
-                note = note[:177] + "..."
-            lines.append(
-                f"• {_format_rocky_heartbeat_time(item.get('completed_at'), relative=False)} · "
-                f"{decision}\n  Nächster Lauf: "
-                f"{_format_rocky_heartbeat_time(item.get('next_at'), relative=False)}\n"
-                f"  {note or '(keine Notiz)'}"
+            if len(note) > 320:
+                note = note[:317] + "..."
+            if index > 1:
+                lines.extend(["", "—", ""])
+            lines.extend(
+                [
+                    f"**{index} · {_format_rocky_heartbeat_time(item.get('completed_at'), relative=False)}**",
+                    f"• Entscheidung: {decision}",
+                    f"• Nächster Lauf: {_format_rocky_heartbeat_time(item.get('next_at'), relative=False)}",
+                    "",
+                    note or "(keine Notiz)",
+                ]
             )
         return "\n".join(lines)
 

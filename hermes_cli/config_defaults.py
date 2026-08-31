@@ -1831,6 +1831,8 @@ DEFAULT_CONFIG = {
         "elevenlabs": {
             "voice_id": "pNInz6obpgDQGcFmaJgB",  # Adam
             "model_id": "eleven_multilingual_v2",
+            "speed": 1.0,  # 0.7–1.2, playback speed
+            "apply_text_normalization": "auto",  # auto | on | off
         },
         "openai": {
             "model": "gpt-4o-mini-tts",

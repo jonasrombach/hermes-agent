@@ -273,7 +273,8 @@ def _resolve_tts_client_config() -> Dict[str, Any]:
             "api_key": api_key,
             "model": el.get("model_id") or tts.DEFAULT_ELEVENLABS_MODEL_ID,
             "voice": el.get("voice_id") or tts.DEFAULT_ELEVENLABS_VOICE_ID,
-            "speed": None,
+            "speed": el.get("speed"),
+            "apply_text_normalization": el.get("apply_text_normalization"),
         }
 
     if provider == "deepinfra":

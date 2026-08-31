@@ -1754,6 +1754,35 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
 # ===========================================================================
 # Provider: ElevenLabs (premium)
 # ===========================================================================
+def _elevenlabs_convert_options(el_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build validated ElevenLabs request options from provider config."""
+    options: Dict[str, Any] = {}
+
+    speed = el_config.get("speed")
+    if speed not in (None, ""):
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tts.elevenlabs.speed must be a number between 0.7 and 1.2") from exc
+        if not 0.7 <= speed <= 1.2:
+            raise ValueError("tts.elevenlabs.speed must be between 0.7 and 1.2")
+        VoiceSettings = __import__(
+            "elevenlabs.types", fromlist=["VoiceSettings"]
+        ).VoiceSettings
+        options["voice_settings"] = VoiceSettings(speed=speed)
+
+    normalization = el_config.get("apply_text_normalization")
+    if normalization not in (None, ""):
+        normalization = str(normalization).strip().lower()
+        if normalization not in {"auto", "on", "off"}:
+            raise ValueError(
+                "tts.elevenlabs.apply_text_normalization must be auto, on, or off"
+            )
+        options["apply_text_normalization"] = normalization
+
+    return options
+
+
 def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """
     Generate audio using ElevenLabs.
@@ -1787,6 +1816,7 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
+        **_elevenlabs_convert_options(el_config),
     )
 
     # audio_generator yields chunks -- write them all

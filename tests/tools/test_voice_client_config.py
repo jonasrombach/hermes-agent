@@ -141,11 +141,16 @@ def test_edge_tts_relays_openai_goes_direct(voice_home, monkeypatch):
     assert tts["model"]
 
 
-def test_elevenlabs_tts_direct_carries_voice_and_model(voice_home, monkeypatch):
+def test_elevenlabs_tts_direct_carries_provider_options(voice_home, monkeypatch):
     voice_home({
         "tts": {
             "provider": "elevenlabs",
-            "elevenlabs": {"voice_id": "voice123", "model_id": "eleven_turbo_v2"},
+            "elevenlabs": {
+                "voice_id": "voice123",
+                "model_id": "eleven_turbo_v2",
+                "speed": 1.15,
+                "apply_text_normalization": "on",
+            },
         },
     })
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el_key")
@@ -154,6 +159,8 @@ def test_elevenlabs_tts_direct_carries_voice_and_model(voice_home, monkeypatch):
     assert tts["wire"] == "elevenlabs-tts"
     assert tts["voice"] == "voice123"
     assert tts["model"] == "eleven_turbo_v2"
+    assert tts["speed"] == 1.15
+    assert tts["apply_text_normalization"] == "on"
     assert "elevenlabs.io" in tts["base_url"]
 
 

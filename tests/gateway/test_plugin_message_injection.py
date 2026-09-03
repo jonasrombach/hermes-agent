@@ -15,9 +15,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     PlatformConfig,
+    TextDebounceState,
 )
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
+from gateway.session_state import TurnState
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
 
@@ -183,6 +185,67 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [False, RuntimeError("rejected")])
+async def test_dispatch_propagates_adapter_acceptance_or_exception(outcome):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    if isinstance(outcome, Exception):
+        adapter.handle_message.side_effect = outcome
+    else:
+        adapter.handle_message.return_value = outcome
+    runner = _runner(_entry(), adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_base_handler_returns_explicit_scheduling_acceptance(accepted):
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    event = MessageEvent(text="ordinary", source=_entry().origin)
+    adapter._start_session_processing = MagicMock(return_value=accepted)
+
+    assert await adapter.handle_message(event) is accepted
+
+
+@pytest.mark.asyncio
+async def test_base_handler_returns_false_when_scheduling_raises():
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    event = MessageEvent(text="ordinary", source=_entry().origin)
+    adapter._start_session_processing = MagicMock(side_effect=RuntimeError("boom"))
+
+    assert await adapter.handle_message(event) is False
+
+
+@pytest.mark.asyncio
+async def test_private_dispatch_marks_event_without_mutating_stored_origin():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        content="private background turn",
+        plugin_id="notify-plugin",
+        private=True,
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["hermes_private_turn"] is True
+    assert event.source is not entry.origin
+    assert getattr(event.source, "_hermes_private_turn") is True
+    assert not hasattr(entry.origin, "_hermes_private_turn")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entry", "with_adapter"),
     [
@@ -293,6 +356,33 @@ async def test_dispatch_stops_when_gateway_drains_during_lookup():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rejects_changed_origin_for_same_session_id():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    original = _entry()
+    moved = _entry()
+    assert moved.origin is not None
+    moved.origin.chat_id = "99"
+    runner = _runner(original, adapter)
+    object.__setattr__(
+        runner,
+        "_async_session_store",
+        SimpleNamespace(
+            _store=runner.session_store,
+            lookup_by_session_key=AsyncMock(side_effect=[original, moved]),
+        ),
+    )
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=original.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     adapter = _RoutingAdapter()
     adapter.set_message_handler(AsyncMock())
@@ -313,6 +403,45 @@ async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     adapter._message_handler.assert_not_awaited()
     assert adapter._pending_messages[session_key] is event
     assert adapter._active_sessions[session_key].is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_internal_plugin_event_waits_behind_debounced_user_input():
+    adapter = _RoutingAdapter()
+    entry = _entry()
+    source = entry.origin
+    assert source is not None
+    session_key = entry.session_key
+    state = SimpleNamespace(
+        turn=SimpleNamespace(agent=MagicMock()),
+        conversation=SimpleNamespace(queued_events=[]),
+    )
+    runner = _runner(entry, adapter)
+    runner._peek_session_state = lambda _key: state
+    runner._session_state = lambda _key: state
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter.set_message_handler(AsyncMock())
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    user_event = MessageEvent(text="human input", source=source)
+    adapter._text_debounce[session_key] = TextDebounceState(
+        event=user_event,
+        task=None,
+        first_ts=0.0,
+        last_ts=0.0,
+    )
+    adapter_event = MessageEvent(
+        text="plugin wake",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"gateway_session_key": session_key},
+    )
+
+    await adapter.handle_message(adapter_event)
+
+    assert adapter._pending_messages[session_key] is user_event
+    assert state.conversation.queued_events == [adapter_event]
 
 
 @pytest.mark.asyncio
@@ -353,6 +482,7 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
         session_key="agent:main:telegram:dm:42",
         content="wake up",
         plugin_id="notify-plugin",
+        private=False,
     )
 
 
@@ -560,3 +690,280 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+async def test_gateway_ready_emits_once_after_all_live_gateway_seams():
+    """Ready is deferred until running, loop, injector, and idle checker exist."""
+    runner = object.__new__(GatewayRunner)
+    runner._gateway_ready_emitted = False
+    runner._running = False
+    runner._gateway_loop = asyncio.get_running_loop()
+    manager = PluginManager()
+
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        with patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook:
+            runner._emit_gateway_ready_once()
+            invoke_hook.assert_not_called()
+
+            runner._running = True
+            runner._emit_gateway_ready_once()
+            invoke_hook.assert_not_called()
+
+            manager.set_gateway_message_injector(runner, MagicMock())
+            runner._emit_gateway_ready_once()
+            invoke_hook.assert_not_called()
+
+            manager.set_gateway_session_idle_checker(runner, lambda _key: True)
+            runner._emit_gateway_ready_once()
+            runner._emit_gateway_ready_once()
+
+    invoke_hook.assert_called_once_with("gateway_ready", gateway=runner)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_user_input_queues_behind_private_turn_with_cooldown_ack():
+    adapter = _RoutingAdapter()
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    session_key = entry.session_key
+    private_agent = MagicMock()
+    state = SimpleNamespace(
+        turn=SimpleNamespace(
+            private_turn=True,
+            agent=private_agent,
+            busy_ack_ts=0.0,
+            started_ts=0.0,
+        )
+    )
+    runner._peek_session_state = lambda _key: state
+    runner._session_state = lambda _key: state
+    runner._adapter_for_source = lambda _source: adapter
+    runner._effective_busy_input_mode = lambda _source: "interrupt"
+    runner._effective_busy_text_mode = lambda _source: "interrupt"
+    runner._queue_or_replace_pending_event = MagicMock(
+        side_effect=lambda key, event: adapter._pending_messages.__setitem__(key, event)
+    )
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._thread_metadata_for_source = lambda *_args: None
+
+    first = MessageEvent(text="first queued message", source=entry.origin)
+    second = MessageEvent(text="second queued message", source=entry.origin)
+
+    assert await runner._handle_active_session_busy_message(first, session_key) is True
+    assert adapter._pending_messages[session_key] is first
+    private_agent.interrupt.assert_not_called()
+    private_agent.steer.assert_not_called()
+    adapter._send_with_retry.assert_awaited_once()
+    assert adapter._send_with_retry.await_args.kwargs["content"] == (
+        "Private turn in progress — your message is queued for the next turn."
+    )
+
+    assert await runner._handle_active_session_busy_message(second, session_key) is True
+    assert adapter._pending_messages[session_key] is second
+    assert adapter._send_with_retry.await_count == 1
+
+
+def test_plugin_idle_probe_sees_adapter_pending_and_debounced_user_input():
+    adapter = _RoutingAdapter()
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    session_key = entry.session_key
+    source = entry.origin
+    assert source is not None
+    state = SimpleNamespace(
+        turn=SimpleNamespace(agent=None),
+        conversation=SimpleNamespace(queued_events=[]),
+    )
+    runner._peek_session_state = lambda session_key: state
+
+    assert runner._is_plugin_session_idle(session_key) is True
+
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="human follow-up", source=source
+    )
+    assert runner._is_plugin_session_idle(session_key) is False
+    adapter._pending_messages.clear()
+
+    adapter._text_debounce[session_key] = TextDebounceState(
+        event=MessageEvent(text="debounced human input", source=source),
+        task=None,
+        first_ts=0.0,
+        last_ts=0.0,
+    )
+    assert runner._is_plugin_session_idle(session_key) is False
+    adapter._text_debounce.clear()
+
+    state.conversation.queued_events.append(MessageEvent(text="queued", source=source))
+    assert runner._is_plugin_session_idle(session_key) is False
+
+
+def test_turn_state_clear_resets_private_plugin_turn_metadata():
+    state = TurnState(
+        agent=MagicMock(),
+        private_turn=True,
+        busy_ack="queued notice",
+        busy_ack_ts=123.0,
+    )
+
+    state.clear()
+
+    assert state.agent is None
+    assert state.private_turn is False
+    assert state.busy_ack is None
+    assert state.busy_ack_ts == 0.0
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_route_acceptance():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await task
+    receipt.assert_called_once_with(True)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_downstream_rejection():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=False)
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await task
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_downstream_exception():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(
+        side_effect=RuntimeError("route failed")
+    )
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await asyncio.gather(task, return_exceptions=True)
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_failure_is_isolated():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    receipt = MagicMock(side_effect=RuntimeError("receipt failed"))
+    loop_errors = []
+    previous_handler = asyncio.get_running_loop().get_exception_handler()
+    asyncio.get_running_loop().set_exception_handler(
+        lambda _loop, context: loop_errors.append(context)
+    )
+
+    try:
+        assert runner._schedule_plugin_message_injection(
+            session_key="key",
+            content="wake up",
+            plugin_id="notify-plugin",
+            on_dispatch_result=receipt,
+        ) is True
+        task = next(iter(runner._background_tasks))
+        await task
+        await asyncio.sleep(0)
+    finally:
+        asyncio.get_running_loop().set_exception_handler(previous_handler)
+
+    receipt.assert_called_once_with(True)
+    assert loop_errors == []
+
+
+def test_plugin_dispatch_receipt_reports_stale_gateway_rejection():
+    runner = _runner(_entry())
+    loop = MagicMock()
+    loop.is_closed.return_value = False
+    runner._gateway_loop = loop
+    runner._running = False
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is False
+
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_rechecks_pinned_session_at_adapter_acceptance():
+    """A route switch after the runner lookup must be reported as rejected."""
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    old_entry = _entry()
+    new_entry = _entry()
+    new_entry.session_id = "session-43"
+    runner = _runner(old_entry, adapter)
+    adapter.gateway_runner = runner
+    lookups = iter([old_entry, old_entry, new_entry])
+    runner._async_session_store.lookup_by_session_key = AsyncMock(
+        side_effect=lambda _key: next(lookups)
+    )
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter._message_handler.assert_not_awaited()
+
+
+def test_scheduler_rejects_unstarted_unclosed_gateway_loop_without_coroutine():
+    runner = _runner(_entry())
+    loop = asyncio.new_event_loop()
+    receipt = MagicMock()
+    runner._gateway_loop = loop
+
+    try:
+        assert (
+            runner._schedule_plugin_message_injection(
+                session_key="key",
+                content="wake up",
+                plugin_id="notify-plugin",
+                on_dispatch_result=receipt,
+            )
+            is False
+        )
+        receipt.assert_called_once_with(False)
+        assert asyncio.all_tasks(loop) == set()
+        assert runner._background_tasks == set()
+    finally:
+        loop.close()

@@ -67,6 +67,13 @@ class TurnState:
     lease: Any = None
     # Last busy-ack timestamp (debounce; 0.0 = never acked).
     busy_ack_ts: float = 0.0
+    # True when this turn was initiated through the private plugin injection
+    # seam. Presentation suppression is turn-scoped and resets with the rest
+    # of the running state.
+    private_turn: bool = False
+    # Optional busy acknowledgement supplied by the injector. None uses the
+    # generic queued-input acknowledgement.
+    busy_ack: Optional[str] = None
     # Held turn-lease token + the run generation that acquired it.  The old
     # ``_turn_lease_tokens`` dict was keyed by (session_key, generation) so a
     # stale unwind could never free a newer turn's lease; the pair encoding
@@ -85,6 +92,8 @@ class TurnState:
         self.started_ts = 0.0
         self.lease = None
         self.busy_ack_ts = 0.0
+        self.private_turn = False
+        self.busy_ack = None
 
 
 @dataclass

@@ -165,6 +165,55 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_run_agent_propagates_private_policy_into_proxy(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.multiplex_profiles = False
+        source = _make_source()
+        source._hermes_private_turn = True
+        runner._run_agent_via_proxy = AsyncMock(return_value={"final_response": ""})
+
+        await runner._run_agent(
+            message="private",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session",
+        )
+
+        assert runner._run_agent_via_proxy.call_args.kwargs["private_turn"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_agent_private_proxy_end_to_end_suppresses_raw_response(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.multiplex_profiles = False
+        source = _make_source()
+        source._hermes_private_turn = True
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        runner._adapter_for_source = lambda _source: adapter
+        session = _FakeSession(_FakeSSEResponse(
+            sse_chunks=['data: {"choices":[{"delta":{"content":"raw"}}]}\n\n',
+                          "data: [DONE]\n\n"]
+        ))
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent(
+                        message="private",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session",
+                    )
+
+        assert result["final_response"] == ""
+        adapter.send_typing.assert_awaited_once()
+        assert session.captured_json["hermes_private_turn"] is True
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
@@ -283,6 +332,78 @@ class TestRunAgentViaProxy:
         assert len(messages) == 1
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_private_proxy_suppresses_raw_sse_and_keeps_typing(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        source._hermes_private_turn = True
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        runner._adapter_for_source = lambda _source: adapter
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"raw secret"}}]}\n\n',
+                "data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="private",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session",
+                        private_turn=True,
+                    )
+
+        adapter.send_typing.assert_awaited_once()
+        assert result["final_response"] == ""
+        assert result["response_transformed"] is False
+        assert result["messages"][-1]["content"] == ""
+        assert session.captured_json["hermes_private_turn"] is True
+
+    @pytest.mark.asyncio
+    async def test_private_proxy_accepts_only_explicit_trusted_transform(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        source._hermes_private_turn = True
+        adapter = MagicMock()
+        adapter.send_typing = AsyncMock()
+        runner._adapter_for_source = lambda _source: adapter
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"raw"}}]}\n\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                '"hermes":{"response_transformed":true,"final_response":"safe"}}\n\n',
+                "data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="private",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session",
+                        private_turn=True,
+                    )
+
+        assert result["final_response"] == "safe"
+        assert result["response_transformed"] is True
+        assert result["messages"][-1]["content"] == "safe"
 
 
 class TestEnvVarRegistration:

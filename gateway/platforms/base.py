@@ -6081,7 +6081,19 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        process_coro = self._process_message_background(event, session_key)
+        try:
+            task = asyncio.create_task(process_coro)
+        except Exception:
+            process_coro.close()
+            self._release_session_guard(session_key, guard=guard)
+            logger.warning(
+                "[%s] Could not schedule processing for %s",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
+            return False
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -6242,7 +6254,7 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(self, event: MessageEvent) -> bool:
         """
         Process an incoming message.
         
@@ -6251,7 +6263,7 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
-            return
+            return False
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
@@ -6282,7 +6294,32 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
-            return
+            return False
+
+        if (event.metadata or {}).get("gateway_session_strict"):
+            # This is the final acceptance boundary before scheduling the
+            # background task. Re-read the pinned owner after the runner's
+            # routing lookup so a reset/resume cannot yield a false receipt.
+            runner = getattr(self, "gateway_runner", None)
+            async_store = getattr(runner, "async_session_store", None)
+            lookup = getattr(async_store, "lookup_by_session_key", None)
+            expected_session_id = str(
+                (event.metadata or {}).get("gateway_session_id") or ""
+            ).strip()
+            if callable(lookup):
+                current_entry = await lookup(expected_session_key)
+                if (
+                    current_entry is None
+                    or not expected_session_id
+                    or current_entry.session_id != expected_session_id
+                ):
+                    logger.info(
+                        "Dropping stale internally routed event before scheduling: "
+                        "session=%s session_id=%s",
+                        expected_session_key,
+                        expected_session_id or "missing",
+                    )
+                    return False
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6325,7 +6362,7 @@ class BasePlatformAdapter(ABC):
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
-                    return
+                    return True
 
                 # Other bypass commands (/approve, /deny, /status,
                 # /bg, /restart) just need direct dispatch — they
@@ -6353,7 +6390,7 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
-                return
+                return True
 
             # Clarify reply bypass: if the agent is blocked on a
             # clarify_tool call, the next non-command message in this
@@ -6409,12 +6446,12 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
-                    return
+                    return True
 
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
-                        return
+                        return True
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
@@ -6424,7 +6461,7 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
-                return  # Don't interrupt now - will run after current task completes
+                return True  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
                 logger.debug(
@@ -6448,7 +6485,7 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
-            return  # Don't process now - will be handled after current task finishes
+            return True  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
@@ -6457,7 +6494,16 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        try:
+            return self._start_session_processing(event, session_key)
+        except Exception:
+            logger.warning(
+                "[%s] Message scheduling failed for %s",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
+            return False
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -6491,6 +6537,10 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        private_turn = bool(
+            getattr(event.source, "_hermes_private_turn", False)
+            or (getattr(event, "metadata", None) or {}).get("hermes_private_turn")
+        )
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6632,6 +6682,15 @@ class BasePlatformAdapter(ABC):
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
+                if private_turn:
+                    # A private turn may publish only its trusted transformed
+                    # text final. Attachments are separate external effects and
+                    # must never escape through MEDIA tags, markdown images, or
+                    # bare local paths embedded in that text.
+                    images = []
+                    media_files = []
+                    local_files = []
+
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
                 # below then drops it silently. Recover on every platform (#33842
@@ -6665,7 +6724,8 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
+                if (not private_turn
+                        and self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -7107,6 +7167,11 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            # Private turns are internal work. Never turn an exception into a
+            # user-visible fallback, while retaining the normal logging and
+            # cleanup path above/below.
+            if private_turn:
+                return
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__

@@ -1000,6 +1000,71 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert "messages" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_private_stream_suppresses_raw_deltas_tools_and_errors(self, adapter):
+        async def _mock_run_agent(**kwargs):
+            assert kwargs["stream_delta_callback"] is None
+            assert kwargs["tool_start_callback"] is None
+            assert kwargs["tool_complete_callback"] is None
+            return (
+                {
+                    "final_response": "trusted notice",
+                    "response_transformed": True,
+                    "completed": True,
+                    "messages": [],
+                },
+                {},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [{"role": "user", "content": "private"}],
+                        "stream": True,
+                        "hermes_private_turn": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "trusted notice" in body
+        assert "hermes.tool.progress" not in body
+
+    @pytest.mark.asyncio
+    async def test_private_nonstream_suppresses_raw_partial_and_error_details(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    {
+                        "final_response": "raw partial secret",
+                        "partial": True,
+                        "completed": False,
+                        "error": "sensitive provider failure",
+                    },
+                    {},
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [{"role": "user", "content": "private"}],
+                        "hermes_private_turn": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 502
+        assert "raw partial secret" not in body
+        assert "sensitive provider failure" not in body
+        assert "Private agent run did not produce a response." in body
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):

@@ -6,13 +6,16 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.run import TurnRunner
 from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -227,6 +230,77 @@ class FakeAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class PrivateLeakyAgent:
+    """Attempts every user-visible progress path during a private turn."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        progress = getattr(self, "tool_progress_callback", None)
+        stream = getattr(self, "stream_delta_callback", None)
+        interim = getattr(self, "interim_assistant_callback", None)
+        status = getattr(self, "status_callback", None)
+        if progress:
+            progress("tool.started", "web_search", "secret query")
+        if stream:
+            stream("streamed secret")
+        if interim:
+            interim("interim secret")
+        if status:
+            status("status", "status secret")
+        notice = getattr(self, "notice_callback", None)
+        if notice:
+            notice(types.SimpleNamespace(text="notice secret"))
+        background_review = getattr(self, "background_review_callback", None)
+        if background_review:
+            background_review("background review secret")
+        if progress:
+            progress(
+                "subagent.complete",
+                "delegate_task",
+                "subagent failure secret",
+                status="failed",
+                goal="private goal",
+                summary="private failure",
+            )
+        return {
+            "final_response": "unmarked private response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class PrivateTransformedAgent(PrivateLeakyAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "deliberate notification",
+            "response_transformed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class PrivateFailedAgent(PrivateLeakyAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "NO_REPLY",
+            "messages": [],
+            "api_calls": 1,
+            "failed": True,
+            "error": "provider error secret",
+        }
+
+
+class StreamingProbeAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._auto_tts_default = True
+
+    def supports_streaming_tts(self, chat_id, audio_format):
+        return True
 
 
 class NativeTaskCardAdapter(ProgressCaptureAdapter):
@@ -1006,6 +1080,8 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    private_turn=False,
+    message_type=None,
 ):
     if config_data:
         import yaml
@@ -1035,6 +1111,8 @@ async def _run_with_agent(
         user_id=user_id,
         scope_id=scope_id,
     )
+    if private_turn:
+        setattr(source, "_hermes_private_turn", True)
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
@@ -1053,8 +1131,296 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        message_type=message_type,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_private_turn_suppresses_progress_streaming_and_untransformed_final(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateLeakyAgent,
+        session_id="sess-private-silent",
+        private_turn=True,
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+                "thinking_progress": True,
+            },
+            "streaming": {"enabled": True, "buffer_threshold": 1},
+        },
+    )
+
+    assert result["final_response"] == ""
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_private_voice_turn_does_not_create_streaming_tts_consumer(
+    monkeypatch, tmp_path
+):
+    adapter = StreamingProbeAdapter()
+    created = []
+
+    class FakeStreamingConsumer:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(
+        "gateway.streaming_tts_consumer.StreamingTTSConsumer",
+        FakeStreamingConsumer,
+    )
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateLeakyAgent,
+        session_id="sess-private-tts",
+        private_turn=True,
+        message_type=MessageType.VOICE,
+        adapter_cls=StreamingProbeAdapter,
+        config_data={"streaming": {"enabled": True}},
+    )
+
+    assert result["final_response"] == ""
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_private_voice_turn_disables_whole_file_tts():
+    adapter = StreamingProbeAdapter()
+    adapter.play_tts = AsyncMock()
+    event = MessageEvent(
+        text="private reply",
+        message_type=MessageType.VOICE,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+        ),
+    )
+    event.source._hermes_private_turn = True
+    adapter._message_handler = AsyncMock(return_value="private reply")
+
+    with (
+        patch("tools.tts_tool.check_tts_requirements", return_value=True) as check_tts,
+        patch("tools.tts_tool.text_to_speech_tool") as text_to_speech,
+    ):
+        await adapter._process_message_background(event, "agent:main:telegram:dm:42")
+
+    check_tts.assert_not_called()
+    text_to_speech.assert_not_called()
+    adapter.play_tts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_transformed_final_does_not_deliver_attachments(tmp_path):
+    media_path = tmp_path / "private-document.pdf"
+    media_path.write_bytes(b"private attachment")
+    adapter = ProgressCaptureAdapter()
+    adapter.send_multiple_images = AsyncMock()
+    adapter.send_voice = AsyncMock()
+    adapter.send_video = AsyncMock()
+    adapter.send_document = AsyncMock()
+    event = MessageEvent(
+        text="private wake",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+        ),
+    )
+    setattr(event.source, "_hermes_private_turn", True)
+    adapter._message_handler = AsyncMock(
+        return_value=f"deliberate notification\nMEDIA:{media_path}"
+    )
+
+    await adapter._process_message_background(event, "agent:main:telegram:dm:42")
+
+    assert [item["content"] for item in adapter.sent] == ["deliberate notification"]
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_voice.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_turn_does_not_emit_clarify_or_approval_prompts(
+    monkeypatch, tmp_path
+):
+    class PrivatePromptAgent(PrivateTransformedAgent):
+        approval_notify = None
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            clarify_callback = getattr(self, "clarify_callback")
+            assert clarify_callback("private question", ["yes"]) == (
+                "[Clarification unavailable during a private turn]"
+            )
+            approval_notify = type(self).approval_notify
+            assert callable(approval_notify)
+            approval_notify(
+                {"command": "rm private-file", "description": "private approval"}
+            )
+            return super().run_conversation(message, conversation_history, task_id)
+
+    from tools import approval as approval_module
+
+    monkeypatch.setattr(
+        approval_module,
+        "register_gateway_notify",
+        lambda _session_key, callback: setattr(PrivatePromptAgent, "approval_notify", callback),
+    )
+    monkeypatch.setattr(approval_module, "unregister_gateway_notify", lambda _session_key: None)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivatePromptAgent,
+        session_id="sess-private-prompts",
+        private_turn=True,
+    )
+
+    assert result["final_response"] == "deliberate notification"
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_private_failed_agent_result_is_not_delivered(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateFailedAgent,
+        session_id="sess-private-failed",
+        private_turn=True,
+    )
+
+    assert result["final_response"] == ""
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_private_exception_does_not_send_generic_error():
+    adapter = ProgressCaptureAdapter()
+    event = MessageEvent(
+        text="private wake",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+        ),
+    )
+    event.source._hermes_private_turn = True
+    adapter._message_handler = AsyncMock(side_effect=RuntimeError("private error secret"))
+
+    await adapter._process_message_background(event, "agent:main:telegram:dm:42")
+
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.LOCAL, Platform.TELEGRAM])
+async def test_private_local_turn_matrix_suppresses_all_interim_surfaces(
+    monkeypatch, tmp_path, platform
+):
+    """Private local turns suppress every callback-driven chat surface."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateLeakyAgent,
+        session_id=f"sess-private-matrix-{platform.value}",
+        private_turn=True,
+        platform=platform,
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+                "thinking_progress": True,
+                "memory_notifications": "verbose",
+                "show_reasoning": True,
+            },
+            "streaming": {"enabled": True, "buffer_threshold": 1},
+        },
+    )
+
+    assert result["final_response"] == ""
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_private_subagent_failure_does_not_schedule_notice():
+    """Private failure callbacks must stop before the user-facing notice rail."""
+    runner = types.SimpleNamespace(_deliver_platform_notice=AsyncMock())
+    source = types.SimpleNamespace(_hermes_private_turn=True)
+    ctx = TurnContext(
+        source=source,
+        _run_still_current=lambda: True,
+        _loop_for_step=asyncio.get_running_loop(),
+    )
+
+    with patch("gateway.run.safe_schedule_threadsafe") as schedule:
+        def _close_coro(coro, *_args, **_kwargs):
+            coro.close()
+            return None
+
+        schedule.side_effect = _close_coro
+        TurnRunner(runner, ctx).progress_callback(
+            "subagent.complete",
+            "delegate_task",
+            "failure secret",
+            status="failed",
+            goal="private goal",
+            summary="private failure",
+        )
+
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_private_telegram_turn_keeps_typing_indicator_allowed():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    event = MessageEvent(
+        text="private wake",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+        ),
+    )
+    event.source._hermes_private_turn = True
+    async def _slow_empty_handler(_event):
+        await asyncio.sleep(0.02)
+        return None
+
+    adapter._message_handler = _slow_empty_handler
+
+    await adapter._process_message_background(event, "agent:main:telegram:dm:42")
+
+    assert any(call.get("metadata") != {"stopped": True} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_private_turn_preserves_explicit_transformed_final(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PrivateTransformedAgent,
+        session_id="sess-private-notify",
+        private_turn=True,
+        config_data={"streaming": {"enabled": True, "buffer_threshold": 1}},
+    )
+
+    assert result["final_response"] == "deliberate notification"
+    assert adapter.sent == []
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio

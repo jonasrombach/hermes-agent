@@ -161,7 +161,86 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
         session_key="agent:main:telegram:dm:42",
         content="[system] wake up",
         plugin_id="notify-plugin",
+        private=False,
     )
+
+
+def test_gateway_private_injection_is_explicitly_forwarded(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "background wake",
+        session_key="agent:main:telegram:dm:42",
+        private=True,
+    ) is True
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42",
+        content="background wake",
+        plugin_id="notify-plugin",
+        private=True,
+    )
+
+
+def test_gateway_dispatch_result_callback_is_forwarded(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    receipt = MagicMock()
+
+    assert context.inject_message(
+        "background wake",
+        session_key="agent:main:telegram:dm:42",
+        on_dispatch_result=receipt,
+    ) is True
+
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42",
+        content="background wake",
+        plugin_id="notify-plugin",
+        private=False,
+        on_dispatch_result=receipt,
+    )
+
+
+def test_gateway_session_idle_probe_is_available_to_plugins():
+    context, manager = _context()
+    owner = object()
+    manager.set_gateway_session_idle_checker(owner, lambda key: key == "idle")
+
+    assert context.is_gateway_session_idle("idle") is True
+    assert context.is_gateway_session_idle("busy") is False
+    manager.clear_gateway_message_injector(owner)
+    assert context.is_gateway_session_idle("idle") is None
+
+
+def test_gateway_seams_clear_only_their_current_owner():
+    context, manager = _context()
+    first = object()
+    second = object()
+    manager.set_gateway_message_injector(first, lambda **_: True)
+    manager.set_gateway_session_idle_checker(first, lambda _key: True)
+    manager.set_gateway_message_injector(second, lambda **_: False)
+    manager.set_gateway_session_idle_checker(second, lambda _key: False)
+
+    manager.clear_gateway_message_injector(first)
+    assert manager.has_gateway_message_injector is True
+    assert context.is_gateway_session_idle("x") is False
+
+    manager.clear_gateway_message_injector(second)
+    assert manager.has_gateway_message_injector is False
+    assert context.is_gateway_session_idle("x") is None
 
 
 def test_gateway_injection_returns_host_rejection(tmp_path, monkeypatch):

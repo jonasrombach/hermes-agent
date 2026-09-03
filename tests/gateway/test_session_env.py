@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import threading
 
 import pytest
 
@@ -236,6 +238,122 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
     }
+
+
+@pytest.mark.asyncio
+async def test_reused_gateway_plugin_tool_sees_rotated_session_id_and_isolation(
+    monkeypatch,
+):
+    """A reused gateway agent must bind each Telegram turn's durable id.
+
+    This crosses the real gateway executor and registry dispatch boundary with
+    a plugin-registered tool.  The same agent handles two sequential turns
+    (including a durable-session rotation), then two concurrent sessions.  The
+    plugin also enters a delegated-child scope to prove that child identity is
+    temporary and cannot leak back into the parent tool turn.
+    """
+    from agent.delegation_context import delegated_child_context
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-session")
+    observed = []
+    barrier = threading.Barrier(2)
+    tool_name = "test_gateway_session_context_plugin_tool"
+
+    def plugin_tool(_args, **_kwargs):
+        parent = {
+            "session_key": get_session_env("HERMES_SESSION_KEY"),
+            "session_id": get_session_env("HERMES_SESSION_ID"),
+        }
+        if _args.get("wait_for_peer"):
+            barrier.wait(timeout=2)
+        with delegated_child_context(f"child:{parent['session_id']}"):
+            child_id = get_session_env("HERMES_SESSION_ID")
+        result = {**parent, "child_session_id": child_id,
+                  "after_child_session_id": get_session_env("HERMES_SESSION_ID")}
+        observed.append(result)
+        return json.dumps(result)
+
+    manager = PluginManager()
+    plugin_context = PluginContext(
+        PluginManifest(name="test-session-plugin", key="test-session-plugin", source="user"),
+        manager,
+    )
+    registration = plugin_context.register_tool(
+        name=tool_name,
+        toolset="test-session-plugin",
+        schema={
+            "name": tool_name,
+            "description": "Test-only session context probe",
+            "parameters": {"type": "object"},
+        },
+        handler=plugin_tool,
+        check_fn=lambda: True,
+    )
+    assert registration is not None
+
+    class ReusedAgent:
+        def run_tool(self, args):
+            return registry.dispatch(
+                tool_name,
+                args,
+                scope=manager.scope_key,
+            )
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    agent = ReusedAgent()
+
+    async def run_turn(chat_id, session_id, *, wait_for_peer=False):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=chat_id,
+        )
+        context = SessionContext(
+            source=source,
+            connected_platforms=[],
+            home_channels={},
+            session_key=f"agent:main:telegram:dm:{chat_id}",
+            session_id=session_id,
+        )
+        tokens = runner._set_session_env(context)
+        try:
+            result: str = await runner._run_in_executor_with_context(
+                agent.run_tool,
+                {"wait_for_peer": wait_for_peer},
+            )
+            return json.loads(result)
+        finally:
+            runner._clear_session_env(tokens)
+
+    try:
+        first = await run_turn("2144471399", "durable-session-v1")
+        second = await run_turn("2144471399", "durable-session-v2")
+        concurrent = await asyncio.gather(
+            run_turn("session-a", "durable-session-a", wait_for_peer=True),
+            run_turn("session-b", "durable-session-b", wait_for_peer=True),
+        )
+    finally:
+        registration.release()
+        runner._shutdown_executor()
+
+    assert first["session_key"] == "agent:main:telegram:dm:2144471399"
+    assert first["session_id"] == "durable-session-v1"
+    assert second["session_id"] == "durable-session-v2"
+    for result in (first, second, *concurrent):
+        assert result["child_session_id"].startswith("child:")
+        assert result["after_child_session_id"] == result["session_id"]
+    assert {
+        (result["session_key"], result["session_id"])
+        for result in concurrent
+    } == {
+        ("agent:main:telegram:dm:session-a", "durable-session-a"),
+        ("agent:main:telegram:dm:session-b", "durable-session-b"),
+    }
+    assert len(observed) == 4
 
 
 

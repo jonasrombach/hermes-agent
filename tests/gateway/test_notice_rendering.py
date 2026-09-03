@@ -101,6 +101,7 @@ def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     # auto-attribute would read as a truthy "stamped profile" and trip the
     # fail-closed path in _adapter_for_source (see AGENTS.md pitfall #17).
     src.profile = None
+    src._hermes_private_turn = False
     return src
 
 

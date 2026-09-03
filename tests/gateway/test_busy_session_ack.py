@@ -3,7 +3,9 @@
 Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
+import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +30,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     Platform,
+    SendResult,
     SessionSource,
     build_session_key,
 )
@@ -187,6 +190,65 @@ class TestBusySessionAck:
 
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
+
+    @pytest.mark.asyncio
+    async def test_private_busy_ack_honors_config_and_does_not_stamp_failed_send(self, monkeypatch):
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_ack_locks = {}
+        adapter = _make_adapter()
+        event = _make_event(text="queued")
+        event.source._hermes_private_turn = True
+        sk = build_session_key(event.source)
+        state = SimpleNamespace(
+            turn=SimpleNamespace(private_turn=True, agent=MagicMock(), busy_ack_ts=0.0)
+        )
+        runner._peek_session_state = lambda _key: state
+        runner._session_state = lambda _key: state
+        runner._queue_or_replace_pending_event = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {"display": {"busy_ack_enabled": False}})
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+        adapter._send_with_retry.assert_not_awaited()
+        assert state.turn.busy_ack_ts == 0.0
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        adapter._send_with_retry.return_value = SendResult(False, error="offline")
+        await runner._handle_active_session_busy_message(event, sk)
+        assert state.turn.busy_ack_ts == 0.0
+
+    @pytest.mark.asyncio
+    async def test_private_busy_ack_cooldown_is_atomic_under_concurrency(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_ack_locks = {}
+        adapter = _make_adapter()
+        event = _make_event(text="queued")
+        event.source._hermes_private_turn = True
+        sk = build_session_key(event.source)
+        state = SimpleNamespace(
+            turn=SimpleNamespace(private_turn=True, agent=MagicMock(), busy_ack_ts=0.0)
+        )
+        runner._peek_session_state = lambda _key: state
+        runner._session_state = lambda _key: state
+        runner._queue_or_replace_pending_event = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+
+        async def _send(**_kwargs):
+            await asyncio.sleep(0)
+            return SendResult(True, message_id="ack")
+
+        adapter._send_with_retry.side_effect = _send
+        await asyncio.gather(
+            runner._handle_active_session_busy_message(event, sk),
+            runner._handle_active_session_busy_message(event, sk),
+        )
+
+        assert adapter._send_with_retry.await_count == 1
+        assert state.turn.busy_ack_ts > 0
 
 
     @pytest.mark.asyncio

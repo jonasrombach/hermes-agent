@@ -5063,6 +5063,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        private_turn = body.get("hermes_private_turn") is True
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -5268,11 +5269,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
+                stream_delta_callback=None if private_turn else _on_delta,
+                tool_start_callback=None if private_turn else _on_tool_start,
+                tool_complete_callback=None if private_turn else _on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                private_turn=private_turn,
                 **agent_overrides,
                 route=route,
             ))
@@ -5284,6 +5286,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                private_turn=private_turn,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -5294,6 +5297,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                private_turn=private_turn,
                 **agent_overrides,
                 route=route,
             )
@@ -5322,7 +5326,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return web.json_response(
                     _openai_error(
-                        f"Internal server error: {e}", err_type="server_error"
+                        (
+                            "Private agent run failed."
+                            if private_turn
+                            else f"Internal server error: {e}"
+                        ),
+                        err_type="server_error",
                     ),
                     status=500,
                 )
@@ -5335,7 +5344,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return web.json_response(
                     _openai_error(
-                        f"Internal server error: {e}", err_type="server_error"
+                        (
+                            "Private agent run failed."
+                            if private_turn
+                            else f"Internal server error: {e}"
+                        ),
+                        err_type="server_error",
                     ),
                     status=500,
                 )
@@ -5346,6 +5360,12 @@ class APIServerAdapter(BasePlatformAdapter):
         completed = bool(result.get("completed", True))
         raw_err_msg = result.get("error")
         err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
+        if private_turn:
+            # Private turns may expose only a trusted post-transform final. Raw
+            # model output, partial output, and failure details stay internal.
+            if not result.get("response_transformed") or is_failed or is_partial or not completed:
+                final_response = ""
+            err_msg = None
 
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
@@ -5368,7 +5388,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # silently rendering the internal failure string as message.content.
         if not final_response and (is_failed or is_partial):
             err_body = _openai_error(
-                err_msg or "Agent run did not produce a response.",
+                err_msg or (
+                    "Private agent run did not produce a response."
+                    if private_turn
+                    else "Agent run did not produce a response."
+                ),
                 err_type="server_error",
                 code="agent_incomplete",
             )
@@ -5424,6 +5448,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        private_turn: bool = False,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -5540,6 +5565,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            if private_turn:
+                err_msg = None
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -5575,6 +5602,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
                 }
+            if (
+                isinstance(result, dict)
+                and result.get("response_transformed")
+                and not is_failed
+                and not is_partial
+                and completed
+            ):
+                finish_chunk.setdefault("hermes", {}).update({
+                    "response_transformed": True,
+                    "final_response": result.get("final_response") or "",
+                })
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -7265,6 +7303,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        private_turn: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7339,6 +7378,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if private_turn:
+                        agent._hermes_private_turn = True
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())

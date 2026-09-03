@@ -4529,6 +4529,27 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     return not final_response or final_response == error_text
 
 
+def _private_final_response(agent_result: dict) -> str:
+    """Return only a trusted, usable final for a private gateway turn."""
+    if not isinstance(agent_result, dict):
+        return ""
+    if (
+        agent_result.get("failed")
+        or agent_result.get("interrupted")
+        or agent_result.get("partial")
+        or agent_result.get("completed") is False
+        or agent_result.get("error")
+        or agent_result.get("response_transformed") is not True
+    ):
+        return ""
+    final_response = agent_result.get("final_response")
+    if not isinstance(final_response, str) or not final_response.strip():
+        return ""
+    if final_response.strip().upper() in {"NO_REPLY", "NO REPLY", "SILENT", "[SILENT]"}:
+        return ""
+    return final_response
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -4709,7 +4730,11 @@ class TurnRunner:
                     SUBAGENT_FAILURE_STATUSES,
                     format_subagent_failure_line,
                 )
-                if _sub_status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
+                if (
+                    _sub_status in SUBAGENT_FAILURE_STATUSES
+                    and getattr(ctx.source, "_hermes_private_turn", False) is not True
+                    and ctx._run_still_current()
+                ):
                     _line = format_subagent_failure_line(
                         kwargs.get("goal"),
                         _sub_status,
@@ -5568,6 +5593,8 @@ class TurnRunner:
     def voice_ack_callback(self, call_id, tool_name, args):
         """tool_start_callback: speak a one-time ack in the voice channel."""
         ctx = self._ctx
+        if getattr(ctx.source, "_hermes_private_turn", False):
+            return
         if ctx._voice_ack_fired[0] or ctx._voice_ack_guild[0] is None:
             return
         if not ctx._run_still_current():
@@ -5744,7 +5771,11 @@ class TurnRunner:
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         ctx = self._ctx
-        if not ctx._status_adapter or not ctx._run_still_current():
+        if (
+            getattr(ctx.source, "_hermes_private_turn", False)
+            or not ctx._status_adapter
+            or not ctx._run_still_current()
+        ):
             return
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
@@ -5879,6 +5910,8 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if getattr(ctx.source, "_hermes_private_turn", False):
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -6284,7 +6317,11 @@ class TurnRunner:
         # clear). The clear callback is a no-op: a sent platform message
         # can't be cleanly retracted, and the band already fired once.
         def _notice_callback_sync(notice) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if (
+                getattr(ctx.source, "_hermes_private_turn", False)
+                or not ctx._status_adapter
+                or not ctx._run_still_current()
+            ):
                 return
             try:
                 line = render_notice_line(notice)
@@ -6336,7 +6373,11 @@ class TurnRunner:
         _bg_review_pending_lock = threading.Lock()
 
         def _deliver_bg_review_message(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if (
+                getattr(ctx.source, "_hermes_private_turn", False)
+                or not ctx._status_adapter
+                or not ctx._run_still_current()
+            ):
                 return
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
@@ -6359,7 +6400,11 @@ class TurnRunner:
 
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if (
+                getattr(ctx.source, "_hermes_private_turn", False)
+                or not ctx._status_adapter
+                or not ctx._run_still_current()
+            ):
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -6389,7 +6434,11 @@ class TurnRunner:
         _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
         if isinstance(_mem_notif, bool):
             _mem_notif = "on" if _mem_notif else "off"
-        agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
+        agent.memory_notifications = (
+            "off"
+            if getattr(ctx.source, "_hermes_private_turn", False)
+            else (str(_mem_notif).lower() if _mem_notif else "on")
+        )
 
         # ------------------------------------------------------------------
         # Shared native-stream boundary close.  For platforms with native
@@ -6451,6 +6500,8 @@ class TurnRunner:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
+            if getattr(ctx.source, "_hermes_private_turn", False):
+                return "[Clarification unavailable during a private turn]"
             if not ctx._status_adapter:
                 return ""
 
@@ -6655,6 +6706,8 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            if getattr(ctx.source, "_hermes_private_turn", False):
+                return
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -7540,6 +7593,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        # Per-session lock serializes busy-ack cooldown check + delivery.
+        self._busy_ack_locks: Dict[str, asyncio.Lock] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -10876,6 +10931,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _busy_ack_enabled_for_source(self, source: SessionSource) -> bool:
+        """Resolve the busy acknowledgement gate for one platform."""
+        env_value = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED")
+        if env_value is not None:
+            return env_value.strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            return bool(
+                resolve_display_setting(
+                    _load_gateway_config(),
+                    _platform_config_key(source.platform),
+                    "busy_ack_enabled",
+                    True,
+                )
+            )
+        except Exception:
+            return True
+
+    async def _send_busy_ack(
+        self,
+        *,
+        adapter,
+        source: SessionSource,
+        session_key: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Send one busy acknowledgement with an atomic per-session cooldown."""
+        if not self._busy_ack_enabled_for_source(source):
+            logger.debug("Busy ack suppressed for session %s", session_key)
+            return True
+        locks = getattr(self, "_busy_ack_locks", None)
+        if locks is None:
+            locks = {}
+            self._busy_ack_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+        async with lock:
+            state = self._session_state(session_key)
+            turn = state.turn
+            now = time.time()
+            if now - getattr(turn, "busy_ack_ts", 0.0) < 30:
+                return True
+            try:
+                result = await adapter._send_with_retry(
+                    chat_id=source.chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.debug("Failed to send busy-ack: %s", exc)
+                return True
+            if result is None or getattr(result, "success", False):
+                turn.busy_ack_ts = now
+            return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -11003,6 +11119,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
+        busy_state = self._peek_session_state(session_key)
+        if (
+            busy_state is not None
+            and getattr(getattr(busy_state, "turn", None), "private_turn", False)
+            and event.message_type == MessageType.TEXT
+            and not event.is_command()
+            and not getattr(event, "internal", False)
+        ):
+            self._queue_or_replace_pending_event(session_key, event)
+            busy_turn = busy_state.turn
+            await self._send_busy_ack(
+                adapter=adapter,
+                source=event.source,
+                session_key=session_key,
+                content=(
+                    getattr(busy_turn, "busy_ack", None)
+                    or "Private turn in progress — your message is queued for the next turn."
+                ),
+                reply_to=self._reply_anchor_for_event(event),
+                metadata=self._thread_metadata_for_source(
+                    event.source, self._reply_anchor_for_event(event)
+                ),
+            )
+            return True
+
         # --- Internal synthetic events must never interrupt/steer ---
         # Async-delegation completions (delegate_task(background=true)) and
         # background-process completions (terminal notify_on_complete) re-enter
@@ -11015,6 +11156,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
         if getattr(event, "internal", False) and not event.allow_gateway_control:
+            adapter = self._adapter_for_source(event.source)
+            if adapter is not None and session_key in getattr(adapter, "_text_debounce", {}):
+                # A queue-mode user message may still be held in the adapter's
+                # debounce buffer. Flush it into the existing pending/FIFO
+                # path before appending the internal event, or the wake would
+                # overtake the user's input.
+                flush_debounce = getattr(adapter, "_flush_text_debounce_now", None)
+                if callable(flush_debounce):
+                    try:
+                        flush_result = flush_debounce(session_key)
+                        if inspect.isawaitable(flush_result):
+                            await flush_result
+                    except Exception:
+                        logger.debug(
+                            "Could not flush debounced input before internal event",
+                            exc_info=True,
+                        )
             self._queue_or_replace_pending_event(session_key, event)
             return True
         if getattr(event, "internal", False):
@@ -11164,22 +11322,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass  # don't let interrupt failure block the ack
 
-        # Check if busy ack is disabled — skip sending but still process the input.
-        # Placed before debounce so we don't stamp a "last ack" timestamp that was
-        # never actually delivered.
-        busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
-            logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
-
-        # Debounce before consulting config-heavy display settings. Rapid
-        # follow-ups should be processed but should not trigger another config
-        # read just to discover that no ack will be sent.
-        _BUSY_ACK_COOLDOWN = 30
+        # Busy-ack gating and cooldown are handled by _send_busy_ack so the
+        # decision and successful delivery are atomic per session.
         now = time.time()
-        last_ack = _busy_state.turn.busy_ack_ts if _busy_state else 0
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
@@ -11204,8 +11349,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not steer_ack_enabled:
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
                 return True
-
-        self._session_state(session_key).turn.busy_ack_ts = now
 
         # Build a status-rich acknowledgment. Mobile chat defaults keep this
         # terse; detailed iteration/tool state is still available in logs and
@@ -11304,23 +11447,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-        try:
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-                ),
-                metadata=thread_meta,
-            )
-        except Exception as e:
-            logger.debug("Failed to send busy-ack: %s", e)
-
-        return True
+        return await self._send_busy_ack(
+            adapter=adapter,
+            source=event.source,
+            session_key=session_key,
+            content=message,
+            reply_to=(
+                reply_anchor
+                if event.source.platform == Platform.TELEGRAM
+                and event.source.chat_type == "dm"
+                and event.source.thread_id
+                else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+            ),
+            metadata=thread_meta,
+        )
 
     async def _drain_active_agents(
         self, timeout: float, cron_timeout: Optional[float] = None
@@ -14193,6 +14333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._install_plugin_message_injector()
+        self._emit_gateway_ready_once()
         self._update_runtime_status("running")
 
         try:
@@ -17523,6 +17664,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if getattr(source, "_hermes_private_turn", False):
+            return
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -17562,6 +17705,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         await adapter.send(source.chat_id, content, metadata=metadata)
+
+    async def _send_gateway_interim_notice(
+        self,
+        source: SessionSource,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        adapter=None,
+    ):
+        """Send a non-final notice unless the turn is private."""
+        if getattr(source, "_hermes_private_turn", False):
+            return None
+        adapter = adapter or self._adapter_for_source(source)
+        if not adapter:
+            return None
+        try:
+            return await adapter.send(
+                source.chat_id,
+                content,
+                metadata=_interim_metadata(
+                    _non_conversational_metadata(metadata, platform=source.platform)
+                ),
+            )
+        except Exception as exc:
+            logger.debug("Gateway interim notice failed: %s", exc)
+            return None
 
     async def _resolve_async_delegation_session(
         self,
@@ -19597,6 +19766,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+        _claim_state.turn.private_turn = bool(
+            (getattr(event, "metadata", None) or {}).get("hermes_private_turn")
+        )
+        _claim_state.turn.busy_ack = (getattr(event, "metadata", None) or {}).get(
+            "hermes_busy_ack"
+        )
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
@@ -19655,6 +19830,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
             self._release_running_agent_state(_quick_key)
+            # Topic recovery may rewrite event.source and run the agent under a
+            # different routing key than the pre-recovery claim above. Release
+            # that resolved key too; otherwise the agent publication for the
+            # recovered key remains visible to plugin idle probes forever.
+            try:
+                _resolved_key = self._session_key_for_source(event.source)
+            except Exception:
+                _resolved_key = None
+            if _resolved_key and _resolved_key != _quick_key:
+                self._release_running_agent_state(_resolved_key)
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
@@ -20256,10 +20441,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Publish this live gateway's plugin message scheduler."""
         from hermes_cli.plugins import get_plugin_manager
 
-        get_plugin_manager().set_gateway_message_injector(
+        manager = get_plugin_manager()
+        manager.set_gateway_message_injector(
             self,
             self._schedule_plugin_message_injection,
         )
+        manager.set_gateway_session_idle_checker(self, self._is_plugin_session_idle)
+
+    def _is_plugin_session_idle(self, session_key: str) -> bool:
+        """Return whether a session has no active work or queued input."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        turn = getattr(state, "turn", None) if state is not None else None
+        if getattr(turn, "agent", None) is not None:
+            return False
+        # Keep the probe safe for legacy/bare runner instances that still
+        # expose the pre-SessionState running-agent mapping.
+        try:
+            if session_key in getattr(self, "_running_agents", {}):
+                return False
+        except Exception:
+            pass
+        adapters = list(getattr(self, "adapters", {}).values())
+        adapters.extend(getattr(self, "_profile_adapters", {}).values())
+        seen = set()
+        for adapter in adapters:
+            if id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            if session_key in getattr(adapter, "_active_sessions", {}):
+                return False
+            if session_key in getattr(adapter, "_pending_messages", {}):
+                return False
+            # Queue-mode text is held here until its debounce timer flushes;
+            # treating the session as idle would let an internal injection
+            # overtake that user input.
+            if session_key in getattr(adapter, "_text_debounce", {}):
+                return False
+        conversation = getattr(state, "conversation", None) if state is not None else None
+        return not bool(getattr(conversation, "queued_events", None))
+
+    def _emit_gateway_ready_once(self) -> None:
+        """Emit the generic ready hook once after gateway seams are live."""
+        if getattr(self, "_gateway_ready_emitted", False):
+            return
+        if not getattr(self, "_running", False):
+            return
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            manager = get_plugin_manager()
+            if (
+                not manager.has_gateway_message_injector
+                or getattr(manager, "_gateway_session_idle_checker", None) is None
+            ):
+                logger.debug("Gateway ready hook deferred until plugin seams are installed")
+                return
+        except Exception:
+            logger.debug("Gateway ready seam check failed", exc_info=True)
+            return
+        self._gateway_ready_emitted = True
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+
+            invoke_hook("gateway_ready", gateway=self)
+        except Exception:
+            logger.debug("Plugin gateway_ready hook failed", exc_info=True)
 
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""
@@ -20273,17 +20523,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        private: bool = False,
+        busy_ack: str | None = None,
+        on_dispatch_result: Optional[Callable[[bool], None]] = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
-        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+
+        result_reported = [False]
+
+        def _report_result(result: bool) -> None:
+            if result_reported[0]:
+                return
+            result_reported[0] = True
+            if on_dispatch_result is None:
+                return
+            try:
+                on_dispatch_result(bool(result))
+            except Exception:
+                logger.warning(
+                    "Plugin message injection result callback failed: "
+                    "plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                    exc_info=True,
+                )
+
+        if (
+            not getattr(self, "_running", False)
+            or loop is None
+            or loop.is_closed()
+            or not loop.is_running()
+        ):
+            _report_result(False)
             return False
 
-        coro = self._dispatch_plugin_message_injection(
-            session_key=session_key,
-            content=content,
-            plugin_id=plugin_id,
-        )
+        async def _dispatch_with_result() -> bool:
+            try:
+                result = bool(
+                    await self._dispatch_plugin_message_injection(
+                        session_key=session_key,
+                        content=content,
+                        plugin_id=plugin_id,
+                        private=private,
+                        **({"busy_ack": busy_ack} if busy_ack is not None else {}),
+                    )
+                )
+            except Exception:
+                _report_result(False)
+                raise
+            else:
+                _report_result(result)
+                return result
+            finally:
+                # A cancelled task may never reach the ``else`` branch, but
+                # cancellation is still a definitive failed dispatch for the
+                # receipt contract.
+                if not result_reported[0]:
+                    _report_result(False)
+
+        coro = _dispatch_with_result()
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -20298,6 +20597,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Plugin message injection scheduling failed",
                     exc_info=True,
                 )
+                _report_result(False)
                 return False
             self._background_tasks.add(future)
             future.add_done_callback(self._background_tasks.discard)
@@ -20310,14 +20610,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_level=logging.WARNING,
             )
             if future is None:
+                _report_result(False)
                 return False
 
         def _log_result(completed) -> None:
             try:
                 accepted = completed.result()
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                _report_result(False)
                 return
             except Exception:
+                _report_result(False)
                 logger.warning(
                     "Plugin message injection failed: plugin=%s session=%s",
                     plugin_id,
@@ -20325,6 +20628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
                 return
+            _report_result(bool(accepted))
             if not accepted:
                 logger.warning(
                     "Plugin message injection was not routed: plugin=%s session=%s",
@@ -20341,6 +20645,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        private: bool = False,
+        busy_ack: str | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
@@ -20353,6 +20659,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         source = dataclasses.replace(entry.origin)
+        if private:
+            setattr(source, "_hermes_private_turn", True)
         try:
             if not self._is_user_authorized(
                 source,
@@ -20379,6 +20687,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             return False
 
+        # Repeat the pinned ownership check immediately before handing the event
+        # to the adapter. The first lookup selects the origin; a reset/resume can
+        # replace the key while authorization and adapter resolution await.
+        current_entry = await self.async_session_store.lookup_by_session_key(
+            session_key
+        )
+        if (
+            current_entry is None
+            or current_entry.session_id != entry.session_id
+            or current_entry.origin is None
+            or current_entry.origin != entry.origin
+        ):
+            logger.info(
+                "Plugin message injection became stale before adapter acceptance: "
+                "plugin=%s session=%s",
+                plugin_id,
+                session_key,
+            )
+            return False
+        entry = current_entry
+
         event = MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
@@ -20391,9 +20720,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "gateway_session_key": session_key,
                 "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
+                **({"hermes_private_turn": True} if private else {}),
+                **({"hermes_busy_ack": busy_ack} if busy_ack is not None else {}),
             },
         )
-        await adapter.handle_message(event)
+        try:
+            accepted = await adapter.handle_message(event)
+        except Exception:
+            logger.warning(
+                "Plugin message injection adapter rejected: plugin=%s session=%s",
+                plugin_id,
+                session_key,
+                exc_info=True,
+            )
+            return False
+        if not accepted:
+            logger.warning(
+                "Plugin message injection was not accepted: plugin=%s session=%s",
+                plugin_id,
+                session_key,
+            )
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id,
@@ -20446,6 +20793,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         event_metadata = getattr(event, "metadata", None) or {}
+        if event_metadata.get("hermes_private_turn"):
+            setattr(source, "_hermes_private_turn", True)
         expected_session_key = str(
             event_metadata.get("gateway_session_key") or ""
         ).strip()
@@ -22163,22 +22512,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=event.message_type,
-            )
+            agent_result = None
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=event.message_type,
+                )
+            except Exception as _agent_exc:
+                if not getattr(source, "_hermes_private_turn", False):
+                    raise
+                logger.error(
+                    "Private gateway agent turn failed silently for session %s: %s",
+                    session_key or "?",
+                    _agent_exc,
+                    exc_info=True,
+                )
+                agent_result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "failed": True,
+                    "error": str(_agent_exc),
+                }
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -22219,21 +22586,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
-            # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
-            # ("Codex response remained incomplete after 3 continuation
-            # attempts") doubles as final_response, so it would be delivered
-            # verbatim into the channel — where peer agents can ingest it as a
-            # completed assistant turn (#51628). Blank it here so the normal
-            # empty-response handling (and the suppression below) applies.
-            if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
-                response = ""
-            try:
-                from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
-                )
-            except Exception:
-                _intentional_silence = False
+            private_turn = bool(getattr(source, "_hermes_private_turn", False))
+            if private_turn:
+                raw_private_response = response
+                response = _private_final_response(agent_result)
+                if raw_private_response and not response:
+                    logger.info(
+                        "Suppressing non-transformed private final for session %s",
+                        session_key or "?",
+                    )
+                _intentional_silence = not response
+            else:
+                # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
+                # ("Codex response remained incomplete after 3 continuation
+                # attempts") doubles as final_response, so it would be delivered
+                # verbatim into the channel — where peer agents can ingest it as a
+                # completed assistant turn (#51628). Blank it here so the normal
+                # empty-response handling (and the suppression below) applies.
+                if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+                    response = ""
+                try:
+                    from gateway.response_filters import is_intentional_silence_agent_result
+                    _intentional_silence = is_intentional_silence_agent_result(
+                        agent_result, response,
+                    )
+                except Exception:
+                    _intentional_silence = False
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -22341,7 +22719,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                not private_turn
+                and _show_reasoning_effective
+                and response
+                and not _intentional_silence
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     from gateway.stream_consumer import escape_code_fences_for_display
@@ -22400,7 +22783,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                not private_turn
+                and _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -22753,6 +23142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if (
                 not _streaming_tts_done
+                and not getattr(source, "_hermes_private_turn", False)
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -22769,7 +23159,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
-                if response:
+                if response and not getattr(source, "_hermes_private_turn", False):
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
@@ -22869,6 +23259,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+            if getattr(source, "_hermes_private_turn", False):
+                return ""
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
             status_hint = ""
@@ -26472,6 +26864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
@@ -29666,6 +30059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        private_turn: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -29683,19 +30077,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
         except ImportError:
             return {
-                "final_response": "⚠️ Proxy mode requires aiohttp. Install with: pip install aiohttp",
+                "final_response": "" if private_turn else "⚠️ Proxy mode requires aiohttp. Install with: pip install aiohttp",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "response_transformed": False,
             }
 
         proxy_url = self._get_proxy_url()
         if not proxy_url:
             return {
-                "final_response": "⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
+                "final_response": "" if private_turn else "⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "response_transformed": False,
             }
 
         # Scope-aware read: the proxy key is a per-profile credential; under
@@ -29752,9 +30148,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "messages": api_messages,
             "stream": True,
         }
+        if private_turn:
+            # Transport policy for the remote runtime; the local relay remains
+            # the final presentation boundary.
+            body["hermes_private_turn"] = True
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
+        _trusted_transformed_response: Optional[str] = None
         _scfg = getattr(getattr(self, "config", None), "streaming", None)
         if _scfg is None:
             from gateway.config import StreamingConfig
@@ -29774,7 +30175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
-        if _streaming_enabled:
+        if _streaming_enabled and not private_turn:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._adapter_for_source(source)
@@ -29829,10 +30230,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             resp.status, proxy_url, error_text[:500],
                         )
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": "" if private_turn else f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "response_transformed": False,
                         }
 
                     # Parse SSE stream
@@ -29868,6 +30270,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     break
                                 try:
                                     obj = json.loads(data)
+                                    hermes = obj.get("hermes")
+                                    if (
+                                        private_turn
+                                        and isinstance(hermes, dict)
+                                        and hermes.get("response_transformed") is True
+                                        and isinstance(hermes.get("final_response"), str)
+                                    ):
+                                        _trusted_transformed_response = hermes["final_response"]
                                     choices = obj.get("choices", [])
                                     if choices:
                                         delta = choices[0].get("delta", {})
@@ -29889,10 +30299,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
             if not full_response:
                 return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
+                    "final_response": "" if private_turn else f"⚠️ Proxy connection error: {e}",
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "response_transformed": False,
                 }
             # Partial response — return what we got
         finally:
@@ -29927,16 +30338,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         return {
-            "final_response": full_response or "(No response from remote agent)",
+            "final_response": (
+                _trusted_transformed_response or ""
+                if private_turn
+                else full_response or "(No response from remote agent)"
+            ),
             "messages": [
                 {"role": "user", "content": message},
-                {"role": "assistant", "content": full_response},
+                {
+                    "role": "assistant",
+                    "content": (
+                        _trusted_transformed_response or ""
+                        if private_turn
+                        else full_response
+                    ),
+                },
             ],
             "api_calls": 1,
             "tools": [],
             "history_offset": len(history),
             "session_id": session_id,
-            "response_previewed": _stream_consumer is not None and bool(full_response),
+            "response_previewed": (
+                not private_turn
+                and _stream_consumer is not None
+                and bool(full_response)
+            ),
+            "response_transformed": bool(_trusted_transformed_response),
         }
 
     # ------------------------------------------------------------------
@@ -30147,6 +30574,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        user_config = _load_gateway_config()
+        private_turn = bool(getattr(source, "_hermes_private_turn", False))
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -30158,6 +30587,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                private_turn=private_turn,
             )
 
         from run_agent import AIAgent
@@ -30168,7 +30598,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return self._is_session_run_current(session_key, run_generation)
         
-        user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
@@ -30227,6 +30656,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if private_turn:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -30289,6 +30720,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
+        if private_turn:
+            _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -30304,6 +30737,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
+            and not private_turn
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
@@ -30315,6 +30749,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
+        if private_turn:
+            _thinking_enabled = False
         # Slack-native task cards (#29483): when the Slack adapter's opt-in
         # is set, tool progress renders as native plan/task cards via
         # chat.startStream — the progress queue is needed even though Slack
@@ -30324,6 +30760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _native_slack_task_cards = False
         if (
             source.platform == Platform.SLACK
+            and not private_turn
             and _progress_adapter_for_native is not None
             and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
         ):
@@ -30720,6 +31157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             _stts_adapter is not None
             and _is_voice_input
+            and not private_turn
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
         ):
             try:
@@ -30892,7 +31330,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
+            if _NOTIFY_INTERVAL is None or getattr(source, "_hermes_private_turn", False):
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
@@ -30905,6 +31343,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
+                if getattr(source, "_hermes_private_turn", False):
+                    break
                 # Stop heartbeating once this run no longer owns the session
                 # slot or the executor has finished — otherwise a stale
                 # "running: delegate_task" bubble can outlive the run that
@@ -30967,10 +31407,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
+                        _notify_res = await self._send_gateway_interim_notice(
+                            source,
                             _heartbeat_text,
-                            metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
+                            metadata=_status_thread_metadata,
+                            adapter=_notify_adapter,
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
@@ -31194,17 +31635,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
-                            try:
-                                await _warn_adapter.send(
-                                    source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
-                                    metadata=_interim_metadata(_status_thread_metadata),
-                                )
-                            except Exception as _warn_err:
-                                logger.debug("Inactivity warning send error: %s", _warn_err)
+                            await self._send_gateway_interim_notice(
+                                source,
+                                f"⚠️ No activity for {_elapsed_warn} min. "
+                                f"If the agent does not respond soon, it will "
+                                f"be timed out in {_remaining_mins} min. "
+                                f"You can continue waiting or use /reset.",
+                                metadata=_status_thread_metadata,
+                                adapter=_warn_adapter,
+                            )
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         threading.Thread(
@@ -31791,6 +32230,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        if (
+            getattr(source, "_hermes_private_turn", False)
+            and isinstance(response, dict)
+            and not response.get("response_transformed")
+        ):
+            response["final_response"] = ""
+            response["already_sent"] = False
+            response["response_previewed"] = False
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

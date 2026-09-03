@@ -47,6 +47,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    "busy_ack_enabled": True,
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
     # acknowledgment after successfully injecting the user's mid-turn message.
     # Disable when the platform should steer silently (the text still lands in
@@ -283,6 +284,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "busy_ack_enabled",
         "busy_steer_ack_enabled",
         "thinking_progress",
     }:

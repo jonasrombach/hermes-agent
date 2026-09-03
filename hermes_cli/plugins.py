@@ -161,6 +161,10 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Fired once by a live gateway after adapters and plugin message injection
+    # are ready. Kwargs: gateway. Callback failures are isolated by the normal
+    # hook dispatcher.
+    "gateway_ready",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -2049,6 +2053,9 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        private: bool = False,
+        busy_ack: str | None = None,
+        on_dispatch_result: Callable[[bool], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -2060,6 +2067,15 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        ``private=True`` requests a presentation-quiet turn: typing remains
+        visible, while progress, streaming, interim commentary, live status,
+        and untransformed final output are suppressed. It does not make the turn
+        ephemeral: normal same-session transcript persistence is retained for
+        continuity. ``busy_ack`` is passed through for the gateway's idle/busy
+        input policy.
+        ``on_dispatch_result`` is an optional callback invoked once with only
+        a boolean: ``True`` means the gateway routed the event, while ``False``
+        means scheduling or routing failed. Callback failures are isolated.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
 
@@ -2098,12 +2114,18 @@ class PluginContext:
 
         plugin_id = self.manifest.key or self.manifest.name
         try:
+            injection_kwargs = {
+                "session_key": session_key,
+                "content": msg,
+                "plugin_id": plugin_id,
+                "private": bool(private),
+            }
+            if busy_ack is not None:
+                injection_kwargs["busy_ack"] = busy_ack
+            if on_dispatch_result is not None:
+                injection_kwargs["on_dispatch_result"] = on_dispatch_result
             return bool(
-                self._manager.inject_gateway_message(
-                    session_key=session_key,
-                    content=msg,
-                    plugin_id=plugin_id,
-                )
+                self._manager.inject_gateway_message(**injection_kwargs)
             )
         except Exception:
             logger.warning(
@@ -2112,6 +2134,17 @@ class PluginContext:
                 exc_info=True,
             )
             return False
+
+    def is_gateway_session_idle(self, session_key: str) -> bool | None:
+        """Return live gateway idleness for a bound session, when available."""
+        checker = getattr(self._manager, "_gateway_session_idle_checker", None)
+        if checker is None:
+            return None
+        try:
+            return bool(checker[1](session_key))
+        except Exception:
+            logger.debug("gateway session idle check failed", exc_info=True)
+            return None
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
@@ -3757,6 +3790,7 @@ class PluginManager:
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._gateway_session_idle_checker: tuple[object, Callable[[str], bool]] | None = None
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -4210,11 +4244,22 @@ class PluginManager:
         """Publish a live gateway injector and its lifecycle owner."""
         self._gateway_message_injector = (owner, injector)
 
+    def set_gateway_session_idle_checker(
+        self,
+        owner: object,
+        checker: Callable[[str], bool],
+    ) -> None:
+        """Publish a live gateway session-idleness probe for plugins."""
+        self._gateway_session_idle_checker = (owner, checker)
+
     def clear_gateway_message_injector(self, owner: object) -> None:
         """Clear the injector only when it still belongs to ``owner``."""
         registered = self._gateway_message_injector
         if registered is not None and registered[0] is owner:
             self._gateway_message_injector = None
+        idle_checker = self._gateway_session_idle_checker
+        if idle_checker is not None and idle_checker[0] is owner:
+            self._gateway_session_idle_checker = None
 
     def inject_gateway_message(self, **kwargs: Any) -> bool:
         """Submit a plugin-triggered turn to the live gateway."""

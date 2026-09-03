@@ -282,6 +282,10 @@ class TestConfig:
         p = provider_with_config(observation_scopes="per_tag")
         assert p._observation_scopes == "per_tag"
 
+    def test_observation_scopes_accepts_shared(self, provider_with_config):
+        p = provider_with_config(observation_scopes="shared")
+        assert p._observation_scopes == "shared"
+
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -298,6 +302,8 @@ class TestConfig:
             bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
             recall_types=["world", "experience"],
+            prefer_observations=True,
+            recall_min_scores={"final": 0.3},
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
             bank_mission="Test agent mission",
@@ -316,6 +322,8 @@ class TestConfig:
         assert p._bank_retain_mission == "Extract key facts"
         assert p._recall_max_tokens == 2048
         assert p._recall_types == ["world", "experience"]
+        assert p._prefer_observations is True
+        assert p._recall_min_scores == {"final": 0.3}
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
@@ -578,6 +586,76 @@ class TestPrefetch:
         assert captured["query"] == "fix tests"       # current query, not ignored
         assert "fresh memory" in result
         p._client.arecall.assert_called_once()
+
+    def test_recall_passes_preference_and_score_floor(self, provider_with_config):
+        p = provider_with_config(
+            recall_sync=True,
+            recall_types=["world", "experience", "observation"],
+            prefer_observations=True,
+            recall_min_scores={"final": 0.3},
+        )
+        p.prefetch("Jessi")
+        kwargs = p._client.arecall.call_args.kwargs
+        assert kwargs["prefer_observations"] is True
+        assert kwargs["min_scores"] == {"final": 0.3}
+
+    @pytest.mark.parametrize("query", ["ok", "Okay!", "ja", "genau", "mach weiter"])
+    def test_recall_sync_skips_low_information_acknowledgements(
+        self, provider_with_config, query
+    ):
+        p = provider_with_config(recall_sync=True)
+        assert p.prefetch(query) == ""
+        p._client.arecall.assert_not_called()
+
+    @pytest.mark.parametrize("query", ["Jessi?", "Zimmerarrest?", "Und Religion?"])
+    def test_recall_sync_keeps_short_informative_queries(
+        self, provider_with_config, query
+    ):
+        p = provider_with_config(recall_sync=True)
+        p.prefetch(query)
+        assert p._client.arecall.call_args.kwargs["query"] == query
+
+    def test_long_recall_query_preserves_beginning_and_end(self, provider_with_config):
+        p = provider_with_config(recall_sync=True, recall_max_input_chars=20)
+        p.prefetch("abcdefghij-MIDDLE-klmnopqrst")
+        query = p._client.arecall.call_args.kwargs["query"]
+        assert query.startswith("abcdefghij")
+        assert query.endswith("klmnopqrst")
+        assert "MIDDLE" not in query
+
+    def test_recall_renders_temporal_provenance_without_source_excerpt(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            SimpleNamespace(
+                id="fact-1",
+                text="Jonas war spazieren.",
+                type="experience",
+                occurred_start="2026-09-03T09:30:00Z",
+                occurred_end="2026-09-03T10:00:00Z",
+                mentioned_at="2026-09-03T10:05:00Z",
+                document_id="session-1",
+                source_fact_ids=["source-1", "source-2"],
+            )
+        ]))
+        result = p.prefetch("Spaziergang")
+        assert "Jonas war spazieren." in result
+        assert "type=experience" in result
+        assert "occurred=2026-09-03T09:30:00Z..2026-09-03T10:00:00Z" in result
+        assert "mentioned=2026-09-03T10:05:00Z" in result
+        assert "fact=fact-1" in result
+        assert "document=session-1" in result
+        assert "sources=source-1,source-2" in result
+
+    def test_recall_bounds_long_source_id_lists(self, provider_with_config):
+        p = provider_with_config(recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            SimpleNamespace(text="Observation", source_fact_ids=[f"source-{i}" for i in range(7)])
+        ]))
+        result = p.prefetch("topic")
+        assert "sources=source-0,source-1,source-2,source-3,source-4,+2 more" in result
+        assert "source-5" not in result
 
     def test_recall_sync_skips_background_queue(self, provider_with_config):
         # With sync recall there's nothing to prime in the background.

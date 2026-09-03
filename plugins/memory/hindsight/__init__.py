@@ -73,7 +73,7 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.9.2"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -501,7 +501,47 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
-_OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
+_OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations", "shared"}
+
+_LOW_INFORMATION_RECALL_QUERIES = {
+    "ja", "genau", "ok", "okay", "mach weiter", "weiter",
+}
+
+
+def _prepare_recall_query(query: str, max_chars: int) -> str:
+    """Skip obvious acknowledgements and bound long queries head+tail."""
+    query = str(query or "").strip()
+    normalized = query.casefold().strip(" \t\r\n.!?,;:")
+    if normalized in _LOW_INFORMATION_RECALL_QUERIES:
+        return ""
+    if max_chars and len(query) > max_chars:
+        head = max_chars // 2
+        return query[:head] + query[-(max_chars - head):]
+    return query
+
+
+def _format_recall_result(result: Any) -> str:
+    """Render one memory with compact temporal provenance and IDs."""
+    text = getattr(result, "text", "") or ""
+    details: list[str] = []
+    if value := getattr(result, "type", None):
+        details.append(f"type={value}")
+    start = getattr(result, "occurred_start", None)
+    end = getattr(result, "occurred_end", None)
+    if start:
+        details.append(f"occurred={start}" + (f"..{end}" if end and end != start else ""))
+    if value := getattr(result, "mentioned_at", None):
+        details.append(f"mentioned={value}")
+    if value := getattr(result, "id", None):
+        details.append(f"fact={value}")
+    if value := getattr(result, "document_id", None):
+        details.append(f"document={value}")
+    if values := getattr(result, "source_fact_ids", None):
+        shown = [str(value) for value in values[:5]]
+        if len(values) > len(shown):
+            shown.append(f"+{len(values) - len(shown)} more")
+        details.append("sources=" + ",".join(shown))
+    return text + (" [" + "; ".join(details) + "]" if details else "")
 
 
 def _normalize_observation_scopes(value: Any) -> Any:
@@ -877,6 +917,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
+        self._prefer_observations = False
+        self._recall_min_scores: dict[str, float] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -1206,13 +1248,15 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
-            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
+            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'shared' (global observations while retaining fact tags), 'combined' (one scope containing all tags), 'per_tag', 'all_combinations', or a JSON list of tag-lists. Empty uses Hindsight's default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+            {"key": "prefer_observations", "description": "When recalling observations with raw facts, suppress raw facts already represented by a returned observation", "default": False},
+            {"key": "recall_min_scores", "description": "Optional Hindsight per-stage score floors, e.g. {'final': 0.3}", "default": None},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
@@ -1744,6 +1788,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list(configured_types) or ["observation"]
+        self._prefer_observations = bool(self._config.get("prefer_observations", False))
+        configured_min_scores = self._config.get("recall_min_scores")
+        self._recall_min_scores = (
+            dict(configured_min_scores) if isinstance(configured_min_scores, dict) else None
+        )
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
         # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
@@ -1897,9 +1946,9 @@ class HindsightMemoryProvider(MemoryProvider):
         text. Shared by the background prefetch worker (``queue_prefetch``) and
         the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
         """
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        query = _prepare_recall_query(query, self._recall_max_input_chars)
+        if not query:
+            return _RecallResult("", 0)
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
@@ -1915,12 +1964,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["tags_match"] = self._recall_tags_match
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
+            if self._prefer_observations:
+                recall_kwargs["prefer_observations"] = True
+            if self._recall_min_scores:
+                recall_kwargs["min_scores"] = self._recall_min_scores
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            text = "\n".join(
+                f"- {_format_recall_result(r)}" for r in resp.results if getattr(r, "text", "")
+            ) if resp.results else ""
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
@@ -2262,6 +2317,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                if self._prefer_observations:
+                    recall_kwargs["prefer_observations"] = True
+                if self._recall_min_scores:
+                    recall_kwargs["min_scores"] = self._recall_min_scores
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2269,7 +2328,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [f"{i}. {_format_recall_result(r)}" for i, r in enumerate(resp.results, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)

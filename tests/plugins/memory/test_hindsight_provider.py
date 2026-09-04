@@ -628,6 +628,8 @@ class TestPrefetch:
             "Danke fürs Checken :) Das reicht mir erstmal.",
             "Alles klar, dann lassen wir das für jetzt.",
             "Nice, klingt gut 😁",
+            "und restart done :)",
+            "und? :D",
         ],
     )
     def test_recall_sync_skips_low_information_acknowledgements(

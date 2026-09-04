@@ -1384,6 +1384,12 @@ class TestTrivialPromptClassifier:
             "Alles klar, dann lassen wir das für jetzt.",
             "Nice, klingt gut 😁",
             "Yeah, got it, sounds good!",
+            "und restart done :)",
+            "Restart ist done :D",
+            "Neustart fertig 😁",
+            "und? :D",
+            "so?",
+            "and?",
         ):
             assert is_trivial_prompt(t), f"expected trivial: {t!r}"
 
@@ -1399,7 +1405,8 @@ class TestTrivialPromptClassifier:
                   "Genau das meinte ich mit dem Hindsight-Threshold.",
                   "Danke. Kannst du das für morgen eintragen?",
                   "Alles klar, wie geht es jetzt weiter?",
-                  "Ok ja macht Sinn?", "Bin gespannt auf Jessi"):
+                  "Ok ja macht Sinn?", "Bin gespannt auf Jessi",
+                  "Und wann war der Restart?", "So funktioniert Hindsight?"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
 
 

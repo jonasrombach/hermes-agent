@@ -89,17 +89,22 @@ TRIVIAL_PROMPT_RE = re.compile(
 )
 
 _EMOTICON_RE = re.compile(r"(?<!\w)[:;=8xX][-^']?[()dDpPoO/\\]+")
+_CONTEXT_ONLY_FOLLOWUP_RE = re.compile(
+    r"^(und|so|also|well|and|well then)\s*[?!.…]*$", re.IGNORECASE
+)
 _COMPOSED_ACK_TOKENS = {
     "ok", "okay", "ja", "genau", "macht", "sinn", "hab", "habe", "ich",
     "gemacht", "bin", "gespannt", "danke", "fürs", "checken", "das",
     "reicht", "mir", "erstmal", "alles", "klar", "dann", "lassen", "wir",
-    "für", "jetzt", "nice", "klingt", "gut",
+    "für", "jetzt", "nice", "klingt", "gut", "und", "restart", "neustart",
+    "done", "fertig", "erledigt", "ist", "auch", "schon", "wieder",
     "yes", "yeah", "yep", "thanks", "thank", "you", "got", "it",
     "sounds", "good", "makes", "sense", "done", "fine", "cool", "great",
 }
 _COMPOSED_ACK_CUES = {
     "ok", "okay", "ja", "genau", "danke", "alles", "klar", "nice",
-    "yeah", "yep", "thanks", "thank", "got", "done", "cool", "great",
+    "yeah", "yep", "thanks", "thank", "got", "done", "fertig", "erledigt",
+    "cool", "great",
 }
 
 
@@ -110,9 +115,11 @@ def _is_composed_acknowledgement(text: str) -> bool:
     prompt eligible for recall. Bare forms remain handled by
     ``TRIVIAL_PROMPT_RE``; this only adds natural multi-clause combinations.
     """
-    if "?" in text:
-        return False
     normalized = unicodedata.normalize("NFKC", _EMOTICON_RE.sub(" ", text)).casefold()
+    if _CONTEXT_ONLY_FOLLOWUP_RE.fullmatch(normalized.strip()):
+        return True
+    if "?" in normalized:
+        return False
     tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
     return (
         len(tokens) >= 2

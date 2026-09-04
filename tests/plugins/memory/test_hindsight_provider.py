@@ -514,9 +514,11 @@ class TestToolHandlers:
 
 
     def test_recall_success(self, provider):
+        manual_query = "dark mode — exact manual query"
         result = json.loads(provider.handle_tool_call(
-            "hindsight_recall", {"query": "dark mode"}
+            "hindsight_recall", {"query": manual_query}
         ))
+        assert provider._client.arecall.call_args.kwargs["query"] == manual_query
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
 
@@ -623,13 +625,6 @@ class TestPrefetch:
             "ja",
             "genau",
             "mach weiter",
-            "Ok ja macht Sinn :D",
-            "Ok hab ich gemacht. Bin gespannt :)",
-            "Danke fürs Checken :) Das reicht mir erstmal.",
-            "Alles klar, dann lassen wir das für jetzt.",
-            "Nice, klingt gut 😁",
-            "und restart done :)",
-            "und? :D",
         ],
     )
     def test_recall_sync_skips_low_information_acknowledgements(
@@ -719,7 +714,7 @@ class TestPrefetch:
         provider._prefetch_result = "- stale context"
         provider._prefetch_count = 3
 
-        provider.on_turn_start(2, "Ok ja macht Sinn :D")
+        provider.on_turn_start(2, "ok")
 
         assert provider._prefetch_result == ""
         assert provider._prefetch_count == 0

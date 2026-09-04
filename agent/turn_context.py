@@ -41,7 +41,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_trivial_prompt
+from agent.memory_provider import build_auto_recall_query, is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
     anchored_context_tokens,
@@ -1582,6 +1582,10 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
+                _query = build_auto_recall_query(
+                    _query,
+                    messages[:current_turn_user_idx],
+                )
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass

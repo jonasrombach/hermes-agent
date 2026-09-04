@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import re
-import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -88,44 +87,74 @@ TRIVIAL_PROMPT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_EMOTICON_RE = re.compile(r"(?<!\w)[:;=8xX][-^']?[()dDpPoO/\\]+")
-_CONTEXT_ONLY_FOLLOWUP_RE = re.compile(
-    r"^(und|so|also|well|and|well then)\s*[?!.…]*$", re.IGNORECASE
-)
-_COMPOSED_ACK_TOKENS = {
-    "ok", "okay", "ja", "genau", "macht", "sinn", "hab", "habe", "ich",
-    "gemacht", "bin", "gespannt", "danke", "fürs", "checken", "das",
-    "reicht", "mir", "erstmal", "alles", "klar", "dann", "lassen", "wir",
-    "für", "jetzt", "nice", "klingt", "gut", "und", "restart", "neustart",
-    "done", "fertig", "erledigt", "ist", "auch", "schon", "wieder",
-    "yes", "yeah", "yep", "thanks", "thank", "you", "got", "it",
-    "sounds", "good", "makes", "sense", "done", "fine", "cool", "great",
-}
-_COMPOSED_ACK_CUES = {
-    "ok", "okay", "ja", "genau", "danke", "alles", "klar", "nice",
-    "yeah", "yep", "thanks", "thank", "got", "done", "fertig", "erledigt",
-    "cool", "great",
-}
+_MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL | re.IGNORECASE)
+_CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_SYMBOL_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
 
-def _is_composed_acknowledgement(text: str) -> bool:
-    """Recognize acknowledgement-only combinations without matching requests.
+def _clean_auto_recall_text(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = _MEMORY_CONTEXT_RE.sub(" ", text)
+    cleaned = _CODE_BLOCK_RE.sub(" ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
-    The vocabulary is intentionally closed: one unknown content word keeps the
-    prompt eligible for recall. Bare forms remain handled by
-    ``TRIVIAL_PROMPT_RE``; this only adds natural multi-clause combinations.
-    """
-    normalized = unicodedata.normalize("NFKC", _EMOTICON_RE.sub(" ", text)).casefold()
-    if _CONTEXT_ONLY_FOLLOWUP_RE.fullmatch(normalized.strip()):
-        return True
-    if "?" in normalized:
-        return False
-    tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
-    return (
-        len(tokens) >= 2
-        and bool(set(tokens) & _COMPOSED_ACK_CUES)
-        and all(token in _COMPOSED_ACK_TOKENS for token in tokens)
+
+def _head_tail(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return text[:max_chars]
+    head = max_chars // 2
+    return text[:head] + "…" + text[-(max_chars - head - 1):]
+
+
+def build_auto_recall_query(
+    current_user_message: str,
+    prior_messages: List[Dict[str, Any]],
+    *,
+    max_chars: int = 2000,
+) -> str:
+    """Build an automatic recall query from the current turn and one prior round."""
+    if max_chars <= 0:
+        return ""
+    current = _head_tail(_clean_auto_recall_text(current_user_message), min(800, max_chars))
+    current_section = f"Current user message:\n{current}"
+    if len(current_section) >= max_chars:
+        return _head_tail(current_section, max_chars)
+
+    previous_assistant = ""
+    previous_user = ""
+    for message in reversed(prior_messages):
+        role = message.get("role")
+        content = _clean_auto_recall_text(message.get("content"))
+        if not content:
+            continue
+        if not previous_assistant:
+            if role == "assistant":
+                previous_assistant = content
+            continue
+        if role == "user" and not content.startswith("/"):
+            previous_user = content
+            break
+
+    if not previous_user or not previous_assistant:
+        return current_section
+
+    context_prefix = "\n\nImmediate conversation context:\nUser:\n"
+    assistant_prefix = "\n\nAssistant:\n"
+    remaining = max_chars - len(current_section) - len(context_prefix) - len(assistant_prefix)
+    if remaining <= 0:
+        return current_section
+    user_budget = remaining // 2
+    assistant_budget = remaining - user_budget
+    context = (
+        context_prefix
+        + _head_tail(previous_user, user_budget)
+        + assistant_prefix
+        + _head_tail(previous_assistant, assistant_budget)
     )
+    return current_section + context
 
 
 def is_trivial_prompt(text: Optional[str]) -> bool:
@@ -145,7 +174,7 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
         return True
     if stripped.startswith("/"):
         return True
-    return bool(TRIVIAL_PROMPT_RE.match(stripped)) or _is_composed_acknowledgement(stripped)
+    return bool(TRIVIAL_PROMPT_RE.match(stripped)) or bool(_SYMBOL_ONLY_RE.fullmatch(stripped))
 
 
 class MemoryProvider(ABC):

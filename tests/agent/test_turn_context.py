@@ -288,8 +288,26 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(query)
+    mm.prefetch_all.assert_called_once_with(f"Current user message:\n{query}")
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
+def test_prefetch_uses_one_prior_conversation_round():
+    agent, mm = _agent_with_memory_manager()
+    history = [
+        {"role": "user", "content": "Old unrelated topic"},
+        {"role": "assistant", "content": "Old unrelated answer"},
+        {"role": "user", "content": "The recall planner is nearly 3,000 lines."},
+        {"role": "assistant", "content": "That would be over-engineered for us."},
+    ]
+
+    _build(agent, user_message="Ah shit", conversation_history=history)
+
+    sent_query = mm.prefetch_all.call_args.args[0]
+    assert sent_query.startswith("Current user message:\nAh shit")
+    assert "The recall planner is nearly 3,000 lines." in sent_query
+    assert "That would be over-engineered for us." in sent_query
+    assert "Old unrelated" not in sent_query
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

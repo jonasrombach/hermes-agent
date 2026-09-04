@@ -1374,7 +1374,7 @@ class TestTrivialPromptClassifier:
                   "done???", "ok", "yes.", "k", "", "   ", "/help", "lgtm"):
             assert is_trivial_prompt(t), f"expected trivial: {t!r}"
 
-    def test_composed_acknowledgements_are_trivial(self):
+    def test_natural_followups_are_not_hardcoded_as_trivial(self):
         from agent.memory_provider import is_trivial_prompt
 
         for t in (
@@ -1382,16 +1382,72 @@ class TestTrivialPromptClassifier:
             "Ok hab ich gemacht. Bin gespannt :)",
             "Danke fürs Checken :) Das reicht mir erstmal.",
             "Alles klar, dann lassen wir das für jetzt.",
-            "Nice, klingt gut 😁",
-            "Yeah, got it, sounds good!",
             "und restart done :)",
-            "Restart ist done :D",
-            "Neustart fertig 😁",
             "und? :D",
-            "so?",
-            "and?",
+            "hmmmm true that :D",
+            "lol mit typo hat’s natürlich nicht geklappt haha :D",
         ):
-            assert is_trivial_prompt(t), f"expected trivial: {t!r}"
+            assert not is_trivial_prompt(t), f"expected rolling-context recall: {t!r}"
+
+
+class TestAutoRecallQuery:
+    def test_current_message_precedes_one_complete_conversation_round(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "Ah shit",
+            [
+                {"role": "user", "content": "An older topic"},
+                {"role": "assistant", "content": "An older answer"},
+                {"role": "user", "content": "The planner sounds useful."},
+                {"role": "assistant", "content": "It changes almost 3,000 lines."},
+            ],
+        )
+
+        assert query == (
+            "Current user message:\nAh shit\n\n"
+            "Immediate conversation context:\n"
+            "User:\nThe planner sounds useful.\n\n"
+            "Assistant:\nIt changes almost 3,000 lines."
+        )
+        assert "older" not in query.lower()
+
+    def test_runtime_envelopes_and_code_blocks_are_removed(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "true that :D\n<memory-context>irrelevant recall</memory-context>",
+            [
+                {"role": "user", "content": "/restart"},
+                {"role": "assistant", "content": "Back online."},
+                {"role": "user", "content": "The rolling recall is active."},
+                {"role": "assistant", "content": "```python\nsecretish_noise()\n```\nBack online."},
+            ],
+        )
+
+        assert "memory-context" not in query
+        assert "irrelevant recall" not in query
+        assert "secretish_noise" not in query
+        assert "/restart" not in query
+        assert "Back online." in query
+
+    def test_total_limit_prioritizes_current_message(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        current = "CURRENT-START " + ("x" * 700) + " CURRENT-END"
+        query = build_auto_recall_query(
+            current,
+            [
+                {"role": "user", "content": "u" * 2_000},
+                {"role": "assistant", "content": "a" * 2_000 + " ASSISTANT-END"},
+            ],
+            max_chars=1_000,
+        )
+
+        assert len(query) <= 1_000
+        assert "CURRENT-START" in query
+        assert "CURRENT-END" in query
+        assert query.startswith("Current user message:\n")
 
     def test_substantive_and_prefix_collisions_pass_through(self):
         from agent.memory_provider import is_trivial_prompt

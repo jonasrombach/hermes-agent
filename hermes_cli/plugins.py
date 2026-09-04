@@ -2253,7 +2253,9 @@ class PluginContext:
         name behaves (``options``, ``text``, or ``mixed``). Omit it to infer
         ``text`` whenever ``args_hint`` is set, so ``/myplugin `` stays typeable.
 
-        Names conflicting with built-in commands are rejected with a warning.
+        Names conflicting with gateway-visible built-in commands are rejected
+        with a warning. A CLI-only built-in may share its name because the
+        plugin command remains the gateway implementation for that name.
         """
         _plugin_command_accepts_context(handler)
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
@@ -2267,7 +2269,8 @@ class PluginContext:
         # Reject if it conflicts with a built-in command
         try:
             from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
+            builtin = resolve_command(clean)
+            if builtin is not None and not builtin.cli_only:
                 logger.warning(
                     "Plugin '%s' tried to register command '/%s' which conflicts "
                     "with a built-in command. Skipping.",

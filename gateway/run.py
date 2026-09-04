@@ -7401,7 +7401,7 @@ class TurnRunner:
         # also the sole guard on the fallback branch taken when mid-run
         # context compression shrinks the message list below the original
         # history length, preserving the compression-safe behaviour of #160.
-        if "MEDIA:" not in final_response:
+        if not ctx.private_turn and "MEDIA:" not in final_response:
             media_tags, has_voice_directive = _collect_auto_append_media_tags(
                 result.get("messages", []),
                 history_offset=len(agent_history),
@@ -23783,7 +23783,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
+            if private_turn:
+                pass  # private synthetic turns never enter the canonical transcript
+            elif is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -23814,7 +23816,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if is_context_overflow_failure:
+            if private_turn:
+                pass  # agent state and gateway transcript both exclude private turns
+            elif is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
             elif agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure (429/timeout/5xx): persist only the user

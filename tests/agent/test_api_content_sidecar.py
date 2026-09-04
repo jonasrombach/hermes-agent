@@ -246,6 +246,18 @@ def _stub_runtime_main():
 
 
 class TestPrologueStamping:
+    def test_pre_llm_hook_receives_stable_gateway_session_key(self):
+        agent = _FakeAgent()
+        agent._gateway_session_key = "agent:main:telegram:dm:11771229"
+        hook = MagicMock(return_value=[])
+
+        with patch("hermes_cli.plugins.invoke_hook", hook):
+            _build(agent)
+
+        assert hook.call_args.kwargs["gateway_session_key"] == (
+            "agent:main:telegram:dm:11771229"
+        )
+
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
         with patch(

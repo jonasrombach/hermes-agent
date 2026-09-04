@@ -2270,13 +2270,12 @@ class AIAgent:
         def _persist_and_drain() -> None:
             self._drop_trailing_empty_response_scaffolding(messages)
             if getattr(self, "_gateway_private_turn", False):
-                _mark_private_turn_messages(
-                    messages,
-                    start_index=getattr(self, "_persist_user_message_idx", -1),
-                )
-            self._session_messages = messages
-            self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+                start_index = getattr(self, "_persist_user_message_idx", -1)
+                self._session_messages = messages[:start_index] if start_index >= 0 else []
+            else:
+                self._session_messages = messages
+                self._save_session_log(messages)
+                self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
@@ -2393,10 +2392,7 @@ class AIAgent:
         if getattr(self, "_persist_disabled", False):
             return None
         if getattr(self, "_gateway_private_turn", False):
-            _mark_private_turn_messages(
-                messages,
-                start_index=getattr(self, "_persist_user_message_idx", -1),
-            )
+            return None
         if not self._session_db:
             return None
         # Persist user-message override (#48677 chokepoint): historically this

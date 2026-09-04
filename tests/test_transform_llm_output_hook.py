@@ -21,6 +21,7 @@ import yaml
 
 import hermes_cli.plugins as plugins_mod
 from hermes_cli.plugins import PluginManager, VALID_HOOKS
+from agent.turn_finalizer import _apply_transform_results
 
 
 def _make_enabled_plugin(hermes_home: Path, name: str, register_body: str) -> Path:
@@ -133,3 +134,27 @@ def test_no_plugins_returns_empty_results(tmp_path, monkeypatch):
         platform="",
     )
     assert results == []
+
+
+def test_private_turn_fails_closed_when_no_transform_accepts_output():
+    final, transformed, original = _apply_transform_results(
+        "[[rocky-wake]] raw envelope",
+        [],
+        private_turn=True,
+    )
+
+    assert final == "NO_REPLY"
+    assert transformed is True
+    assert original == "[[rocky-wake]] raw envelope"
+
+
+def test_private_turn_releases_only_an_explicit_transform_result():
+    final, transformed, original = _apply_transform_results(
+        "[[rocky-wake]] envelope",
+        [None, "A deliberate visible message"],
+        private_turn=True,
+    )
+
+    assert final == "A deliberate visible message"
+    assert transformed is True
+    assert original == "[[rocky-wake]] envelope"

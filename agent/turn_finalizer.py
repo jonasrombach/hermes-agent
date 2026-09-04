@@ -32,6 +32,21 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
+def _apply_transform_results(
+    final_response: str,
+    results: list,
+    *,
+    private_turn: bool,
+) -> tuple[str, bool, str | None]:
+    """Apply one explicit plugin release; private turns otherwise fail closed."""
+    for hook_result in results:
+        if isinstance(hook_result, str) and hook_result:
+            return hook_result, True, final_response
+    if private_turn:
+        return "NO_REPLY", True, final_response
+    return final_response, False, None
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -624,17 +639,24 @@ def finalize_turn(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
-            for _hook_result in _transform_results:
-                if isinstance(_hook_result, str) and _hook_result:
-                    _pre_transform_response = final_response
-                    final_response = _hook_result
-                    _response_transformed = True
-                    break  # First non-empty string wins
+            final_response, _response_transformed, _pre_transform_response = (
+                _apply_transform_results(
+                    final_response,
+                    _transform_results,
+                    private_turn=bool(getattr(agent, "_gateway_private_turn", False)),
+                )
+            )
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    if getattr(agent, "_gateway_private_turn", False) and not _response_transformed:
+        _pre_transform_response = final_response
+        final_response = "NO_REPLY"
+        _response_transformed = True
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

@@ -1374,13 +1374,32 @@ class TestTrivialPromptClassifier:
                   "done???", "ok", "yes.", "k", "", "   ", "/help", "lgtm"):
             assert is_trivial_prompt(t), f"expected trivial: {t!r}"
 
+    def test_composed_acknowledgements_are_trivial(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        for t in (
+            "Ok ja macht Sinn :D",
+            "Ok hab ich gemacht. Bin gespannt :)",
+            "Danke fürs Checken :) Das reicht mir erstmal.",
+            "Alles klar, dann lassen wir das für jetzt.",
+            "Nice, klingt gut 😁",
+            "Yeah, got it, sounds good!",
+        ):
+            assert is_trivial_prompt(t), f"expected trivial: {t!r}"
+
     def test_substantive_and_prefix_collisions_pass_through(self):
         from agent.memory_provider import is_trivial_prompt
 
         # Words that merely START with a trivial word must not match.
         for t in ("k8s", "yolo", "hive", "note", "supper", "hind",
                   "hello world", "ok so what's next", "what's my name",
-                  "hey can you check the logs", "continue the migration plan"):
+                  "hey can you check the logs", "continue the migration plan",
+                  "Okay, aber was hatte Jessi dazu gesagt?",
+                  "Ja, wann war das nochmal?",
+                  "Genau das meinte ich mit dem Hindsight-Threshold.",
+                  "Danke. Kannst du das für morgen eintragen?",
+                  "Alles klar, wie geht es jetzt weiter?",
+                  "Ok ja macht Sinn?", "Bin gespannt auf Jessi"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
 
 

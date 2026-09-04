@@ -48,7 +48,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
 
-from agent.memory_provider import MemoryProvider, RecallStatus
+from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from tools.registry import tool_error
@@ -503,16 +503,11 @@ def _normalize_retain_tags(value: Any) -> List[str]:
 
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations", "shared"}
 
-_LOW_INFORMATION_RECALL_QUERIES = {
-    "ja", "genau", "ok", "okay", "mach weiter", "weiter",
-}
-
 
 def _prepare_recall_query(query: str, max_chars: int) -> str:
     """Skip obvious acknowledgements and bound long queries head+tail."""
     query = str(query or "").strip()
-    normalized = query.casefold().strip(" \t\r\n.!?,;:")
-    if normalized in _LOW_INFORMATION_RECALL_QUERIES:
+    if is_trivial_prompt(query):
         return ""
     if max_chars and len(query) > max_chars:
         head = max_chars // 2
@@ -807,6 +802,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
         self._budget = "mid"
+        self._auto_recall_budget = "mid"
         self._mode = "cloud"
         self._llm_base_url = ""
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -1257,6 +1253,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "prefer_observations", "description": "When recalling observations with raw facts, suppress raw facts already represented by a returned observation", "default": False},
             {"key": "recall_min_scores", "description": "Optional Hindsight per-stage score floors, e.g. {'final': 0.3}", "default": None},
+            {"key": "auto_recall_budget", "description": "Search-depth budget for automatic per-turn recall (low/mid/high). Defaults to the general recall budget.", "default": ""},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
@@ -1735,6 +1732,8 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
+        auto_budget = self._config.get("auto_recall_budget") or self._budget
+        self._auto_recall_budget = auto_budget if auto_budget in _VALID_BUDGETS else self._budget
 
         memory_mode = self._config.get("memory_mode", "hybrid")
         self._memory_mode = memory_mode if memory_mode in {"context", "tools", "hybrid"} else "hybrid"
@@ -1952,12 +1951,12 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._auto_recall_budget))
                 # Reflect synthesizes across many memories -> no discrete count.
                 return _RecallResult(resp.text or "", 0)
             recall_kwargs: dict = {
                 "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
+                "budget": self._auto_recall_budget, "max_tokens": self._recall_max_tokens,
             }
             if self._recall_tags:
                 recall_kwargs["tags"] = self._recall_tags
@@ -1969,7 +1968,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._recall_min_scores:
                 recall_kwargs["min_scores"] = self._recall_min_scores
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
+                         self._bank_id, len(query), self._auto_recall_budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
@@ -2002,7 +2001,22 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_recall_returned = returned
         self._last_recall_count = count if returned else 0
 
+    def _discard_prefetched_recall(self) -> None:
+        """Drop buffered context that must not leak across a trivial turn."""
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+            self._prefetch_count = 0
+        self._record_recall_indicator(returned=False, count=0)
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Discard stale async recall when the current turn needs no memory."""
+        if is_trivial_prompt(message):
+            self._discard_prefetched_recall()
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if is_trivial_prompt(query):
+            self._discard_prefetched_recall()
+            return ""
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query rather than the previous
         # turn's queued recall. See NousResearch/hermes-agent#5820.
@@ -2042,6 +2056,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # In synchronous mode prefetch() does a live recall each turn, so
         # there's nothing to prime in the background.
         if self._recall_sync:
+            return
+        if is_trivial_prompt(query):
             return
         if self._recall_disabled():
             return

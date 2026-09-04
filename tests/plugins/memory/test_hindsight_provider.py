@@ -306,6 +306,7 @@ class TestConfig:
             recall_types=["world", "experience"],
             prefer_observations=True,
             recall_min_scores={"final": 0.3},
+            auto_recall_budget="low",
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
             bank_mission="Test agent mission",
@@ -326,6 +327,7 @@ class TestConfig:
         assert p._recall_types == ["world", "experience"]
         assert p._prefer_observations is True
         assert p._recall_min_scores == {"final": 0.3}
+        assert p._auto_recall_budget == "low"
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
@@ -601,7 +603,33 @@ class TestPrefetch:
         assert kwargs["prefer_observations"] is True
         assert kwargs["min_scores"] == {"final": 0.3}
 
-    @pytest.mark.parametrize("query", ["ok", "Okay!", "ja", "genau", "mach weiter"])
+    def test_auto_recall_budget_does_not_change_tool_budget(self, provider_with_config):
+        p = provider_with_config(
+            recall_sync=True,
+            recall_budget="mid",
+            auto_recall_budget="low",
+        )
+
+        p.prefetch("What does Jonas prefer?")
+
+        assert p._budget == "mid"
+        assert p._client.arecall.call_args.kwargs["budget"] == "low"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "ok",
+            "Okay!",
+            "ja",
+            "genau",
+            "mach weiter",
+            "Ok ja macht Sinn :D",
+            "Ok hab ich gemacht. Bin gespannt :)",
+            "Danke fürs Checken :) Das reicht mir erstmal.",
+            "Alles klar, dann lassen wir das für jetzt.",
+            "Nice, klingt gut 😁",
+        ],
+    )
     def test_recall_sync_skips_low_information_acknowledgements(
         self, provider_with_config, query
     ):
@@ -609,7 +637,19 @@ class TestPrefetch:
         assert p.prefetch(query) == ""
         p._client.arecall.assert_not_called()
 
-    @pytest.mark.parametrize("query", ["Jessi?", "Zimmerarrest?", "Und Religion?"])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "Jessi?",
+            "Zimmerarrest?",
+            "Und Religion?",
+            "Okay, aber was hatte Jessi dazu gesagt?",
+            "Ja, wann war das nochmal?",
+            "Genau das meinte ich mit dem Hindsight-Threshold.",
+            "Danke. Kannst du das für morgen eintragen?",
+            "Alles klar, wie geht es jetzt weiter?",
+        ],
+    )
     def test_recall_sync_keeps_short_informative_queries(
         self, provider_with_config, query
     ):
@@ -672,6 +712,17 @@ class TestPrefetch:
         result = provider.prefetch("a totally different current query")
         assert "buffered from previous turn" in result
         provider._client.arecall.assert_not_called()
+
+    def test_low_information_turn_discards_buffered_async_recall(self, provider):
+        provider._prefetch_result = "- stale context"
+        provider._prefetch_count = 3
+
+        provider.on_turn_start(2, "Ok ja macht Sinn :D")
+
+        assert provider._prefetch_result == ""
+        assert provider._prefetch_count == 0
+        assert provider.prefetch("Ok ja macht Sinn :D") == ""
+        assert provider.recall_status() is None
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -80,11 +81,44 @@ class RecallStatus:
 # ("hi!", "hey.", "thanks :)", "done???") do.
 TRIVIAL_PROMPT_RE = re.compile(
     r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
+    r'ja|genau|mach weiter|weiter|'
     r'hi|hey|hello|yo|sup|'
     r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
     r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
     re.IGNORECASE,
 )
+
+_EMOTICON_RE = re.compile(r"(?<!\w)[:;=8xX][-^']?[()dDpPoO/\\]+")
+_COMPOSED_ACK_TOKENS = {
+    "ok", "okay", "ja", "genau", "macht", "sinn", "hab", "habe", "ich",
+    "gemacht", "bin", "gespannt", "danke", "fürs", "checken", "das",
+    "reicht", "mir", "erstmal", "alles", "klar", "dann", "lassen", "wir",
+    "für", "jetzt", "nice", "klingt", "gut",
+    "yes", "yeah", "yep", "thanks", "thank", "you", "got", "it",
+    "sounds", "good", "makes", "sense", "done", "fine", "cool", "great",
+}
+_COMPOSED_ACK_CUES = {
+    "ok", "okay", "ja", "genau", "danke", "alles", "klar", "nice",
+    "yeah", "yep", "thanks", "thank", "got", "done", "cool", "great",
+}
+
+
+def _is_composed_acknowledgement(text: str) -> bool:
+    """Recognize acknowledgement-only combinations without matching requests.
+
+    The vocabulary is intentionally closed: one unknown content word keeps the
+    prompt eligible for recall. Bare forms remain handled by
+    ``TRIVIAL_PROMPT_RE``; this only adds natural multi-clause combinations.
+    """
+    if "?" in text:
+        return False
+    normalized = unicodedata.normalize("NFKC", _EMOTICON_RE.sub(" ", text)).casefold()
+    tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    return (
+        len(tokens) >= 2
+        and bool(set(tokens) & _COMPOSED_ACK_CUES)
+        and all(token in _COMPOSED_ACK_TOKENS for token in tokens)
+    )
 
 
 def is_trivial_prompt(text: Optional[str]) -> bool:
@@ -104,7 +138,7 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
         return True
     if stripped.startswith("/"):
         return True
-    return bool(TRIVIAL_PROMPT_RE.match(stripped))
+    return bool(TRIVIAL_PROMPT_RE.match(stripped)) or _is_composed_acknowledgement(stripped)
 
 
 class MemoryProvider(ABC):

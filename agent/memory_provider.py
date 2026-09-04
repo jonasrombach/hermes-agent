@@ -113,7 +113,7 @@ def build_auto_recall_query(
     current_user_message: str,
     prior_messages: List[Dict[str, Any]],
     *,
-    max_chars: int = 2000,
+    max_chars: int = 2100,
 ) -> str:
     """Build an automatic recall query from the current turn and one prior round."""
     if max_chars <= 0:
@@ -143,11 +143,21 @@ def build_auto_recall_query(
 
     context_prefix = "\n\nImmediate conversation context:\nUser:\n"
     assistant_prefix = "\n\nAssistant:\n"
-    remaining = max_chars - len(current_section) - len(context_prefix) - len(assistant_prefix)
-    if remaining <= 0:
+    available = max_chars - len(current_section) - len(context_prefix) - len(assistant_prefix)
+    round_budget = min(1200, available)
+    if round_budget <= 0:
         return current_section
-    user_budget = remaining // 2
-    assistant_budget = remaining - user_budget
+
+    assistant_budget = min(len(previous_assistant), 800, round_budget)
+    user_budget = min(len(previous_user), round_budget - assistant_budget)
+    remaining = round_budget - assistant_budget - user_budget
+    if remaining:
+        extra = min(len(previous_assistant) - assistant_budget, remaining)
+        assistant_budget += extra
+        remaining -= extra
+    if remaining:
+        user_budget += min(len(previous_user) - user_budget, remaining)
+
     context = (
         context_prefix
         + _head_tail(previous_user, user_budget)

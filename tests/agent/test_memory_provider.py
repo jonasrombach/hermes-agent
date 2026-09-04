@@ -1391,6 +1391,23 @@ class TestTrivialPromptClassifier:
 
 
 class TestAutoRecallQuery:
+    def test_current_and_previous_round_have_separate_content_budgets(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "c" * 2_000,
+            [
+                {"role": "user", "content": "u" * 2_000},
+                {"role": "assistant", "content": "a" * 2_000},
+            ],
+        )
+
+        current, context = query.split("\n\nImmediate conversation context:\n", 1)
+        previous_user, previous_assistant = context.split("\n\nAssistant:\n", 1)
+        assert len(current.removeprefix("Current user message:\n")) == 800
+        assert len(previous_user.removeprefix("User:\n")) == 400
+        assert len(previous_assistant) == 800
+
     def test_current_message_precedes_one_complete_conversation_round(self):
         from agent.memory_provider import build_auto_recall_query
 

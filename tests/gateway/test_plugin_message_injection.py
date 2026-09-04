@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -201,6 +202,121 @@ async def test_private_dispatch_marks_event_without_mutating_stored_origin():
     assert event.source is not entry.origin
     assert getattr(event.source, "_hermes_private_turn") is True
     assert not hasattr(entry.origin, "_hermes_private_turn")
+
+
+@pytest.mark.asyncio
+async def test_private_plugin_event_reaches_gateway_setup_before_early_persistence(
+    monkeypatch,
+):
+    """Exercise the plugin event -> gateway cache -> turn-start write boundary.
+
+    Earlier coverage manually set ``agent._gateway_private_turn`` on an already
+    constructed agent. That could not detect a lost marker while the real
+    plugin event crossed the gateway's cached/new-agent setup.
+    """
+    from gateway.run import TurnRunner, _is_private_turn_event
+    from gateway.turn_context import TurnContext
+    from run_agent import AIAgent as RealAIAgent
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    dispatch_runner = _runner(_entry(), adapter)
+    assert await dispatch_runner._dispatch_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="PRIVATE injected envelope",
+        plugin_id="ambient-wake",
+        private=True,
+    )
+    event = adapter.handle_message.await_args.args[0]
+    assert _is_private_turn_event(event, event.source) is True
+
+    early_persistence = []
+    constructed = []
+
+    class ProbeAgent:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs["session_id"])
+            self.model = kwargs["model"]
+            self.session_id = kwargs["session_id"]
+            self.tools = []
+            self.context_compressor = SimpleNamespace(
+                last_prompt_tokens=0,
+                context_length=200_000,
+            )
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self._gateway_private_turn = False
+            self._persist_user_message_idx = 1
+            self._session_persist_lock = None
+            self._session_db = None
+            self._drop_trailing_empty_response_scaffolding = lambda _messages: None
+            self._save_session_log = lambda _messages: (_ for _ in ()).throw(
+                AssertionError("private turn wrote a session log")
+            )
+            self._flush_messages_to_session_db = lambda *_args: (_ for _ in ()).throw(
+                AssertionError("private turn wrote canonical state.db")
+            )
+
+        def run_conversation(self, message, conversation_history=None, **_kwargs):
+            messages = list(conversation_history or []) + [
+                {"role": "user", "content": message}
+            ]
+            RealAIAgent._persist_session(self, messages, conversation_history)
+            early_persistence.append(
+                (self._gateway_private_turn, list(self._session_messages))
+            )
+            return {"final_response": "NO_REPLY", "messages": messages, "api_calls": 1}
+
+    gateway_runner = MagicMock()
+    gateway_runner.config = SimpleNamespace(streaming=None)
+    gateway_runner._provider_routing = {}
+    gateway_runner._agent_cache_lock = threading.RLock()
+    gateway_runner._agent_cache = {}
+    gateway_runner._session_db = None
+    gateway_runner._prefill_messages = None
+    gateway_runner._pending_model_notes = {}
+    gateway_runner._pending_skills_reload_notes = {}
+    gateway_runner.session_store._entries = {}
+    gateway_runner._get_system_prompt_for_channel.return_value = None
+    gateway_runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+    gateway_runner._resolve_session_reasoning_config.return_value = None
+    gateway_runner._resolve_session_service_tier.return_value = None
+    gateway_runner._resolve_turn_agent_config.return_value = {
+        "model": "test-model", "runtime": {}
+    }
+    gateway_runner._agent_config_signature.return_value = ("test-signature",)
+    gateway_runner._extract_cache_busting_config.return_value = {}
+    gateway_runner._refresh_fallback_model.return_value = None
+    gateway_runner._consume_pending_native_image_paths.return_value = []
+    gateway_runner._consume_pending_turn_sidecar_notes.return_value = []
+    gateway_runner._is_telegram_topic_lane.return_value = False
+    gateway_runner._is_discord_auto_thread_lane.return_value = False
+    gateway_runner._is_relay_discord_channel_lane.return_value = False
+
+    ctx = TurnContext(
+        source=event.source,
+        message=event.text,
+        history=[{"role": "assistant", "content": "ordinary history"}],
+        session_id="session-42",
+        session_key="agent:main:telegram:dm:42",
+        private_turn=_is_private_turn_event(event, event.source),
+        user_config={},
+        AIAgent=ProbeAgent,
+        resolve_display_setting=lambda *_args: False,
+        _run_still_current=lambda: True,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+    )
+
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_turn_persisted", lambda _agent: None)
+    TurnRunner(gateway_runner, ctx).run_sync()
+    # Reuse the cached agent too: the turn-private bit must be reset from the
+    # trusted event context before *every* early persistence boundary.
+    TurnRunner(gateway_runner, ctx).run_sync()
+
+    assert constructed == ["session-42"]
+    assert early_persistence == [
+        (True, [{"role": "assistant", "content": "ordinary history"}]),
+        (True, [{"role": "assistant", "content": "ordinary history"}]),
+    ]
 
 
 def test_private_turn_marker_survives_telegram_topic_source_recovery():

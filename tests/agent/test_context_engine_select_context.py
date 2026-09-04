@@ -97,6 +97,36 @@ def test_base_noop_select_context_is_short_circuited_not_called():
     assert not logger.warning.called
 
 
+def test_private_turn_skips_select_context_but_normal_turn_calls_it():
+    calls = []
+
+    class _Engine(_MinimalEngine):
+        def select_context(self, request_messages, **kwargs):
+            calls.append((request_messages, kwargs))
+            return request_messages
+
+    logger = MagicMock()
+    agent = _agent_with(_Engine())
+    agent._gateway_private_turn = True
+    private_request = [{"role": "user", "content": "PRIVATE injected envelope"}]
+
+    private_out = _apply_context_engine_selection(
+        agent, private_request, private_request, private_request[0], logger=logger
+    )
+
+    assert private_out is private_request
+    assert calls == []
+
+    agent._gateway_private_turn = False
+    normal_request = [{"role": "user", "content": "ordinary question"}]
+    normal_out = _apply_context_engine_selection(
+        agent, normal_request, normal_request, normal_request[0], logger=logger
+    )
+
+    assert normal_out is normal_request
+    assert len(calls) == 1
+
+
 
 
 

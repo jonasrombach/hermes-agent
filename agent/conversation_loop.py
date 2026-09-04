@@ -1906,6 +1906,9 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    if getattr(agent, "_gateway_private_turn", False) is True:
+        return api_messages
+
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -3484,7 +3487,9 @@ def run_conversation(
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if has_hook("pre_api_request") and getattr(
+                        agent, "_gateway_private_turn", False
+                    ) is not True:
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -7466,7 +7471,9 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if has_hook("post_api_request") and getattr(
+                    agent, "_gateway_private_turn", False
+                ) is not True:
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )

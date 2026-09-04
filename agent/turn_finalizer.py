@@ -309,13 +309,15 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    # Save trajectory if enabled. ``user_message`` may be a multimodal list of
+    # parts; the trajectory format wants a plain string. Private gateway turns
+    # must not expose their raw transcript to this file-backed observer.
+    if getattr(agent, "_gateway_private_turn", False) is not True:
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -459,6 +461,9 @@ def finalize_turn(
                     # archive_and_compact the CANONICAL session rows — the
                     # exact write class _persist_disabled exists to stop.
                     and not getattr(agent, "_persist_disabled", False)
+                    # Private gateway turns must not give a compressor the
+                    # current raw transcript to archive or summarize.
+                    and getattr(agent, "_gateway_private_turn", False) is not True
                 ):
                     _before = len(messages)
                     _compacted = _compressor._micro_compact(messages)
@@ -493,10 +498,14 @@ def finalize_turn(
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
     # sent with the pre-turn snapshot while the durable DB already has this turn.
-    try:
-        agent._session_messages = messages
-    except Exception:
-        pass
+    # A private turn is the exception: _persist_session has deliberately left
+    # only the pre-turn history in that cache, so restoring ``messages`` here
+    # would leak the private prompt/output into a later normal cached persist.
+    if getattr(agent, "_gateway_private_turn", False) is not True:
+        try:
+            agent._session_messages = messages
+        except Exception:
+            pass
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -661,8 +670,10 @@ def finalize_turn(
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
-    # to an external memory system).
-    if final_response and not interrupted:
+    # to an external memory system). A private gateway turn is never an
+    # observable turn: the hook carries the raw user envelope and full history.
+    _private_turn = getattr(agent, "_gateway_private_turn", False) is True
+    if final_response and not interrupted and not _private_turn:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -682,30 +693,32 @@ def finalize_turn(
     # Context engine observation hook: notify the active engine that this
     # turn has finished, with the finalized transcript. Complements the
     # per-request select_context() hook (selection before the request;
-    # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    # observation after the turn). Private turns cannot publish their raw
+    # transcript to any observer, including a context-engine plugin.
+    if not _private_turn:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -838,6 +851,7 @@ def finalize_turn(
         final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
+        and getattr(agent, "_gateway_private_turn", False) is not True
         and (_should_review_memory or _should_review_skills)
     ):
         try:

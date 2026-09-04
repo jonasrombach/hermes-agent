@@ -5833,7 +5833,7 @@ class TurnRunner:
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
-        if not ctx._run_still_current():
+        if ctx.private_turn or not ctx._run_still_current():
             return
         # prev_tools may be list[str] or list[dict] with "name"/"result"
         # keys.  Normalise to keep "tool_names" backward-compatible for
@@ -23338,7 +23338,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
-            # Emit agent:start hook
+            # Gateway lifecycle hooks receive raw message/response envelopes.
+            # Private turns deliberately remain unobservable outside the primary
+            # model/tool path.
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -23348,7 +23350,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            if not private_turn:
+                await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
@@ -23624,13 +23627,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 response = f"{response}\n\n{_footer_line}"
 
-            # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
-                **hook_ctx,
-                "response": (response or "")[:500],
-                "model": agent_result.get("model", ""),
-                "provider": agent_result.get("provider", ""),
-            })
+            # Emit agent:end hook only for observable turns. ``hook_ctx`` carries
+            # the raw inbound message and this payload carries the raw response.
+            if not private_turn:
+                await self.hooks.emit("agent:end", {
+                    **hook_ctx,
+                    "response": (response or "")[:500],
+                    "model": agent_result.get("model", ""),
+                    "provider": agent_result.get("provider", ""),
+                })
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -24052,6 +24057,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            # Private turns are process-local control envelopes. Do not persist
+            # or present fallback state when their primary run fails.
+            if private_turn:
+                return None
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current

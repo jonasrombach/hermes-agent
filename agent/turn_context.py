@@ -275,6 +275,11 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     if not session_db or not session_id:
         return
 
+    # Private gateway turns are intentionally not observable by auxiliary
+    # consumers; title generation receives the raw prompt and full history.
+    if getattr(agent, "_gateway_private_turn", False) is True:
+        return
+
     if str(getattr(agent, "platform", "") or "").lower() in _UNTITLED_PLATFORMS:
         return
 
@@ -959,7 +964,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        getattr(agent, "_gateway_private_turn", False) is not True
+        and agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -1056,7 +1066,8 @@ def build_turn_context(
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
-        agent.compression_enabled
+        getattr(agent, "_gateway_private_turn", False) is not True
+        and agent.compression_enabled
         and not _review_fork_first_request_pending(agent)
         and _should_run_preflight_estimate(
             messages,
@@ -1468,19 +1479,23 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+        _pre_results = (
+            []
+            if getattr(agent, "_gateway_private_turn", False) is True
+            else _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

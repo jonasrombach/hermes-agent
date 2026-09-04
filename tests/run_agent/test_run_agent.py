@@ -3282,6 +3282,41 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
+    def test_private_turn_skips_api_observers_but_keeps_model_and_transform(self, agent):
+        self._setup_agent(agent)
+        agent._gateway_private_turn = True
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="PRIVATE raw assistant output",
+            finish_reason="stop",
+        )
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("PRIVATE injected envelope")
+
+        assert agent.client.chat.completions.create.called
+        assert result["final_response"] == "NO_REPLY"
+        assert not [
+            name for name, _kwargs in hook_calls
+            if name in {"pre_api_request", "post_api_request"}
+        ]
+        transform_calls = [kwargs for name, kwargs in hook_calls if name == "transform_llm_output"]
+        assert len(transform_calls) == 1
+        assert transform_calls[0]["response_text"] == "PRIVATE raw assistant output"
+
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 

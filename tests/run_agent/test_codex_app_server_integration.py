@@ -83,6 +83,7 @@ class TestRunConversationCodexPath:
         assert result["partial"] is False
         assert result["error"] is None
         assert result["api_calls"] == 1
+        assert result["response_transformed"] is False
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
@@ -304,6 +305,57 @@ class TestRunConversationCodexPath:
         assert call.kwargs["review_skills"] is True
         # Counter should be reset after the review fires
         assert agent._iters_since_skill == 0
+
+    def test_private_codex_turn_skips_background_review(self, fake_session):
+        """The app-server early return must honor the private-turn boundary."""
+        agent = _make_codex_agent()
+        agent._gateway_private_turn = True
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 0
+        agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        agent.valid_tool_names.add("skill_manage")
+
+        with patch.object(agent, "_spawn_background_review", return_value=None) as spawn:
+            agent.run_conversation("PRIVATE codex prompt")
+
+        spawn.assert_not_called()
+
+    def test_private_codex_turn_returns_transform_and_suppresses_raw_observers(self, fake_session):
+        """Private app-server output needs a trusted transform before delivery."""
+        agent = _make_codex_agent()
+        agent._gateway_private_turn = True
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 0
+        agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        agent.valid_tool_names.add("skill_manage")
+
+        with (
+            patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                return_value=["trusted private completion"],
+            ) as transform,
+            patch.object(agent, "_sync_external_memory_for_turn") as sync_memory,
+            patch.object(agent, "_spawn_background_review") as spawn_review,
+        ):
+            result = agent.run_conversation("PRIVATE raw codex completion")
+
+        assert result["final_response"] == "trusted private completion"
+        assert result["response_transformed"] is True
+        assert result["pre_transform_response"] == "echo: PRIVATE raw codex completion"
+        assert transform.call_args.kwargs["response_text"] == "echo: PRIVATE raw codex completion"
+        sync_memory.assert_not_called()
+        spawn_review.assert_not_called()
+
+    def test_private_codex_turn_fails_closed_without_transform(self, fake_session):
+        agent = _make_codex_agent()
+        agent._gateway_private_turn = True
+
+        with patch("hermes_cli.lifecycle.invoke_hook", return_value=[]):
+            result = agent.run_conversation("PRIVATE raw codex completion")
+
+        assert result["final_response"] == "NO_REPLY"
+        assert result["response_transformed"] is True
+        assert result["pre_transform_response"] == "echo: PRIVATE raw codex completion"
 
     def test_background_review_signature_never_breaks(self, fake_session):
         """Even when no trigger fires, the helper must never call

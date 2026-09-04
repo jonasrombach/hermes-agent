@@ -135,6 +135,7 @@ async def test_private_turn_never_returns_raw_model_final(monkeypatch, tmp_path)
         "failed": False,
     })
     event = _event()
+    event.text = "PRIVATE raw inbound"
     event.metadata = {"hermes_private_turn": True}
 
     response = await runner._handle_message_with_agent(
@@ -142,6 +143,44 @@ async def test_private_turn_never_returns_raw_model_final(monkeypatch, tmp_path)
     )
 
     assert response == ""
+    emitted_events = [call.args[0] for call in runner.hooks.emit.await_args_list]
+    assert "agent:start" not in emitted_events
+    assert "agent:end" not in emitted_events
+
+
+@pytest.mark.asyncio
+async def test_private_turn_agent_exception_never_appends_raw_inbound_fallback(monkeypatch, tmp_path):
+    """A failed private run must not persist its raw inbound envelope."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("provider failure"))
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    event = _event()
+    event.text = "PRIVATE raw inbound must not persist"
+    event.metadata = {"hermes_private_turn": True}
+
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response is None
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_private_agent_exception_keeps_fallback_persistence_and_message(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("provider failure"))
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response.startswith("Sorry, I encountered an unexpected error.")
+    runner.session_store.append_to_transcript.assert_called_once()
+    assert runner.session_store.append_to_transcript.call_args.args[1]["content"] == "side chatter"
 
 
 @pytest.mark.asyncio

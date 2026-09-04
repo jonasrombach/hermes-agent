@@ -284,6 +284,38 @@ class TestAgentMessageInterimDispatch:
 
 class TestBridgeRobustness:
 
+    def test_private_turn_suppresses_every_raw_live_event_callback(self):
+        """Private Codex turns may execute, but never expose raw live events."""
+        agent = _make_stub_agent()
+        agent._gateway_private_turn = True
+        agent.tool_start_callback = MagicMock(name="tool_start_callback")
+        agent.tool_complete_callback = MagicMock(name="tool_complete_callback")
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        tool = {
+            "type": "commandExecution",
+            "id": "private-command",
+            "command": "echo PRIVATE tool args",
+            "aggregatedOutput": "PRIVATE tool result",
+            "exitCode": 0,
+        }
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "PRIVATE stream"}})
+        bridge({"method": "item/reasoning/delta", "params": {"delta": "PRIVATE reasoning"}})
+        bridge(_item_started(tool))
+        bridge(_item_completed(tool))
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "private-message",
+            "text": "PRIVATE interim assistant message",
+        }))
+
+        agent._fire_stream_delta.assert_not_called()
+        agent._fire_reasoning_delta.assert_not_called()
+        agent._emit_interim_assistant_message.assert_not_called()
+        agent.tool_progress_callback.assert_not_called()
+        agent.tool_start_callback.assert_not_called()
+        agent.tool_complete_callback.assert_not_called()
+
     def test_missing_params_is_ignored(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)

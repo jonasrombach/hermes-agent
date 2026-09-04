@@ -652,6 +652,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             )
 
     def on_event(note: dict) -> None:
+        # Private gateway turns may execute Codex, but raw event payloads
+        # (assistant text, reasoning, tool args, and tool results) must not
+        # reach any live display callback. The final response still follows
+        # the trusted transform path below run_turn().
+        if getattr(agent, "_gateway_private_turn", False) is True:
+            return
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
@@ -913,7 +919,11 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if (
+        not turn.interrupted
+        and turn.error is None
+        and getattr(agent, "_gateway_private_turn", False) is not True
+    ):
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -930,6 +940,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and getattr(agent, "_gateway_private_turn", False) is not True
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -941,8 +952,39 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    final_response = turn.final_text
+    response_transformed = False
+    pre_transform_response = None
+    if final_response and not turn.interrupted:
+        try:
+            from agent.turn_finalizer import _apply_transform_results
+            from hermes_cli.lifecycle import invoke_hook
+
+            transform_results = invoke_hook(
+                "transform_llm_output",
+                response_text=final_response,
+                session_id=agent.session_id or "",
+                gateway_session_key=getattr(agent, "_gateway_session_key", None) or "",
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+            final_response, response_transformed, pre_transform_response = (
+                _apply_transform_results(
+                    final_response,
+                    transform_results,
+                    private_turn=bool(getattr(agent, "_gateway_private_turn", False)),
+                )
+            )
+        except Exception as exc:
+            logger.warning("transform_llm_output hook failed: %s", exc)
+
+    if getattr(agent, "_gateway_private_turn", False) and not response_transformed:
+        pre_transform_response = final_response
+        final_response = "NO_REPLY"
+        response_transformed = True
+
     return {
-        "final_response": turn.final_text,
+        "final_response": final_response,
         "messages": messages,
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
@@ -954,6 +996,8 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "response_transformed": response_transformed,
+        "pre_transform_response": pre_transform_response,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

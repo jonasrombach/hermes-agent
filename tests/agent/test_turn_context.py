@@ -92,6 +92,7 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        self._gateway_private_turn = False
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
@@ -214,6 +215,25 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_private_turn_skips_pre_llm_observer_but_normal_turn_calls_it(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda name, **kwargs: calls.append((name, kwargs)) or [],
+    )
+    agent = _FakeAgent()
+    agent._gateway_private_turn = True
+
+    _build(agent, user_message="PRIVATE injected envelope")
+
+    assert calls == []
+
+    agent._gateway_private_turn = False
+    _build(agent, user_message="ordinary question")
+
+    assert [name for name, _kwargs in calls] == ["pre_llm_call"]
+
+
 def test_preflight_timeout_stops_turn_before_provider_boundary():
     """An unchanged oversized payload must not escape turn construction."""
     agent = _FakeAgent()
@@ -250,6 +270,42 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
 
     agent._compress_context.assert_called_once()
     provider_call.assert_not_called()
+
+
+def test_private_turn_does_not_compact_or_archive_current_transcript():
+    """Turn-start compaction must not receive private raw transcript material."""
+    agent = _FakeAgent()
+    agent._gateway_private_turn = True
+    agent.compression_enabled = True
+    agent.max_compression_attempts = 1
+    agent.context_compressor = types.SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        threshold_tokens=100,
+        context_length=400,
+        summary_target_ratio=0.3,
+        last_prompt_tokens=0,
+        should_compress=lambda tokens=None: True,
+        should_compress_info=lambda tokens=None: (True, None),
+        get_active_compression_failure_cooldown=lambda: None,
+    )
+    archived_transcripts = []
+
+    def archive_and_compact(messages, *_args, **_kwargs):
+        archived_transcripts.append([message.get("content") for message in messages])
+        return [messages[-1]], "SYSTEM"
+
+    agent._compress_context = MagicMock(side_effect=archive_and_compact)
+    history = [
+        {"role": "user", "content": "old " * 800},
+        {"role": "assistant", "content": "old response"},
+        {"role": "user", "content": "another old turn"},
+    ]
+
+    _build(agent, user_message="PRIVATE current turn", conversation_history=history)
+
+    agent._compress_context.assert_not_called()
+    assert archived_transcripts == []
 
 
 def test_user_message_preserves_platform_event_timestamp():
@@ -513,3 +569,17 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_prologue_does_not_title_private_gateway_turn():
+    """Private raw text must not reach the title-generator side channel."""
+    from agent import turn_context
+
+    agent = _TitlingAgent("telegram")
+    agent._gateway_private_turn = True
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            agent, [{"role": "user", "content": "PRIVATE injected envelope"}]
+        )
+
+    titler.assert_not_called()

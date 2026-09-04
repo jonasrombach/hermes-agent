@@ -111,6 +111,17 @@ def test_finalize_turn_fires_review_when_flag_unset() -> None:
     agent._spawn_background_review.assert_called_once()
 
 
+def test_finalize_turn_skips_review_for_private_turn() -> None:
+    """Private raw prompts and responses never enter a review fork."""
+    agent = _make_agent(skip_background_review=False)
+    _stub_agent_for_finalize(agent)
+    agent._gateway_private_turn = True
+
+    _run_finalize(agent)
+
+    agent._spawn_background_review.assert_not_called()
+
+
 def test_cron_construction_sets_skip_background_review() -> None:
     """The cron scheduler MUST construct AIAgent with skip_background_review=True.
 

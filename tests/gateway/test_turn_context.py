@@ -11,7 +11,7 @@ itself (that's covered by test_run_progress_topics.py et al.).
 import asyncio
 import queue as queue_mod
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -68,6 +68,29 @@ class TestTurnRunner:
         ctx = TurnContext(progress_queue=queue_mod.Queue())
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
+
+    @pytest.mark.asyncio
+    async def test_private_turn_step_hook_is_not_emitted(self):
+        """Step hooks receive tool args/results, so private turns emit none."""
+        source = SimpleNamespace(platform=Platform.TELEGRAM, user_id="private-user")
+        hooks = SimpleNamespace(emit=AsyncMock())
+        ctx = TurnContext(
+            source=source,
+            session_id="private-session",
+            private_turn=True,
+            _run_still_current=lambda: True,
+            _loop_for_step=asyncio.get_running_loop(),
+            _hooks_ref=hooks,
+        )
+
+        await asyncio.to_thread(
+            _make_runner(ctx)._step_callback_sync,
+            1,
+            [{"name": "terminal", "args": {"secret": "PRIVATE"}, "result": "PRIVATE"}],
+        )
+        await asyncio.sleep(0.01)
+
+        hooks.emit.assert_not_awaited()
 
     def test_normal_response_preserves_compression_exhausted(self):
         """A non-empty exhaustion response must still reach auto-reset consumers."""

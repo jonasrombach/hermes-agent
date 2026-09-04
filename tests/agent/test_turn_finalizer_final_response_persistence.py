@@ -35,6 +35,7 @@ class FakeAgent:
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
+        self._gateway_private_turn = False
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -81,8 +82,272 @@ class FakeAgent:
         pass
 
 
+def test_private_turn_never_notifies_post_llm_observers(monkeypatch):
+    """The observer boundary must not receive private raw turn material.
+
+    This invokes the real finalizer rather than only assigning a flag around
+    ``_persist_session``. The former presentation test missed this observer
+    path, which receives the full raw conversation history on a live turn.
+    """
+    observed = []
+
+    def capture_hook(name, **kwargs):
+        if name == "post_llm_call":
+            observed.append(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", capture_hook)
+    agent = FakeAgent()
+    agent._gateway_private_turn = True
+    messages = [
+        {"role": "user", "content": "PRIVATE injected envelope"},
+        {"role": "assistant", "content": "PRIVATE raw assistant output"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="PRIVATE raw assistant output",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="private-task",
+        turn_id="private-turn",
+        user_message="PRIVATE injected envelope",
+        original_user_message="PRIVATE injected envelope",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    assert result["final_response"] == "NO_REPLY"
+    assert observed == []
 
 
+def test_normal_turn_still_notifies_post_llm_observers(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda name, **kwargs: observed.append((name, kwargs)) or [],
+    )
+    agent = FakeAgent()
+    agent._gateway_private_turn = False
+
+    finalize_turn(
+        agent,
+        final_response="ordinary answer",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "ordinary question"}],
+        conversation_history=[],
+        effective_task_id="normal-task",
+        turn_id="normal-turn",
+        user_message="ordinary question",
+        original_user_message="ordinary question",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    post_calls = [kwargs for name, kwargs in observed if name == "post_llm_call"]
+    assert len(post_calls) == 1
+    assert post_calls[0]["assistant_response"] == "ordinary answer"
+
+
+def test_private_turn_never_notifies_context_engine_observer(monkeypatch):
+    observed = []
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda _agent, messages, **_kwargs: observed.append(messages),
+    )
+    agent = FakeAgent()
+    agent._gateway_private_turn = True
+    messages = [
+        {"role": "user", "content": "PRIVATE injected envelope"},
+        {"role": "assistant", "content": "PRIVATE raw assistant output"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="PRIVATE raw assistant output",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="private-task",
+        turn_id="private-turn",
+        user_message="PRIVATE injected envelope",
+        original_user_message="PRIVATE injected envelope",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    assert observed == []
+
+
+def test_normal_turn_still_notifies_context_engine_observer(monkeypatch):
+    observed = []
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda _agent, messages, **_kwargs: observed.append(messages),
+    )
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "ordinary question"}]
+
+    finalize_turn(
+        agent,
+        final_response="ordinary answer",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="normal-task",
+        turn_id="normal-turn",
+        user_message="ordinary question",
+        original_user_message="ordinary question",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    assert observed == [messages]
+
+
+def test_private_finalization_cannot_leak_into_next_cached_normal_persist(monkeypatch):
+    """A private turn must leave only pre-turn history in the agent cache.
+
+    A cached gateway agent starts the next normal turn from ``_session_messages``.
+    If finalization restores the private live transcript after ``_persist_session``
+    strips it, that later normal persist serializes the prior private prompt and
+    response despite the private turn itself having skipped persistence.
+    """
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+
+    class CachedHistoryAgent(FakeAgent):
+        def __init__(self):
+            super().__init__()
+            self.durable_writes = []
+
+        def _persist_session(self, messages, conversation_history):
+            if self._gateway_private_turn:
+                self._session_messages = messages[:self._persist_user_message_idx]
+            else:
+                self.durable_writes.append([dict(message) for message in messages])
+                self._session_messages = messages
+
+    agent = CachedHistoryAgent()
+    agent._gateway_private_turn = True
+    agent._persist_user_message_idx = 1
+    private_messages = [
+        {"role": "assistant", "content": "ordinary cached history"},
+        {"role": "user", "content": "PRIVATE injected envelope"},
+        {"role": "assistant", "content": "PRIVATE raw assistant output"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="PRIVATE raw assistant output",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=private_messages,
+        conversation_history=private_messages[:1],
+        effective_task_id="private-task",
+        turn_id="private-turn",
+        user_message="PRIVATE injected envelope",
+        original_user_message="PRIVATE injected envelope",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    agent._gateway_private_turn = False
+    agent._persist_session(
+        agent._session_messages + [{"role": "user", "content": "ordinary follow-up"}],
+        [],
+    )
+
+    persisted_text = "\n".join(
+        str(message.get("content", ""))
+        for message in agent.durable_writes[-1]
+    )
+    assert "PRIVATE injected envelope" not in persisted_text
+    assert "PRIVATE raw assistant output" not in persisted_text
+    assert "ordinary cached history" in persisted_text
+    assert "ordinary follow-up" in persisted_text
+
+
+def test_private_turn_never_micro_compacts_current_transcript(monkeypatch):
+    """The post-turn compactor must not archive private prompt/output rows."""
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+
+    class RecordingCompressor:
+        _micro_compact_enabled = True
+
+        def __init__(self):
+            self.canonical_writes = []
+
+        def _micro_compact(self, messages):
+            self.canonical_writes.append([message.get("content") for message in messages])
+            return list(messages)
+
+    agent = FakeAgent()
+    agent._gateway_private_turn = True
+    compressor = RecordingCompressor()
+    agent.context_compressor = compressor
+    messages = [
+        {"role": "user", "content": "PRIVATE current prompt"},
+        {"role": "assistant", "content": "PRIVATE current output"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="PRIVATE current output",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="private-task",
+        turn_id="private-turn",
+        user_message="PRIVATE current prompt",
+        original_user_message="PRIVATE current prompt",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    assert compressor.canonical_writes == []
+
+
+def test_private_turn_never_saves_trajectory(monkeypatch):
+    saved = []
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._gateway_private_turn = True
+    agent._save_trajectory = lambda *args: saved.append(args)
+
+    finalize_turn(
+        agent,
+        final_response="PRIVATE raw assistant output",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "PRIVATE injected envelope"},
+            {"role": "assistant", "content": "PRIVATE raw assistant output"},
+        ],
+        conversation_history=[],
+        effective_task_id="private-task",
+        turn_id="private-turn",
+        user_message="PRIVATE injected envelope",
+        original_user_message="PRIVATE injected envelope",
+        _should_review_memory=False,
+        _turn_exit_reason="completed",
+    )
+
+    assert saved == []
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):

@@ -1391,7 +1391,7 @@ class TestTrivialPromptClassifier:
 
 
 class TestAutoRecallQuery:
-    def test_current_and_previous_round_have_separate_content_budgets(self):
+    def test_current_and_recent_context_have_separate_content_budgets(self):
         from agent.memory_provider import build_auto_recall_query
 
         query = build_auto_recall_query(
@@ -1402,20 +1402,18 @@ class TestAutoRecallQuery:
             ],
         )
 
-        current, context = query.split("\n\nImmediate conversation context:\n", 1)
-        previous_user, previous_assistant = context.split("\n\nAssistant:\n", 1)
+        current, context = query.split("\n\nRecent conversation context:\n", 1)
         assert len(current.removeprefix("Current user message:\n")) == 800
-        assert len(previous_user.removeprefix("User:\n")) == 400
-        assert len(previous_assistant) == 800
+        assert len(context.removeprefix("Assistant:\n")) == 1200
 
-    def test_current_message_precedes_one_complete_conversation_round(self):
+    def test_collects_recent_eligible_messages_and_restores_chronology(self):
         from agent.memory_provider import build_auto_recall_query
 
         query = build_auto_recall_query(
             "Ah shit",
             [
-                {"role": "user", "content": "An older topic"},
-                {"role": "assistant", "content": "An older answer"},
+                {"role": "user", "content": "First short message."},
+                {"role": "assistant", "content": "First final answer."},
                 {"role": "user", "content": "The planner sounds useful."},
                 {"role": "assistant", "content": "It changes almost 3,000 lines."},
             ],
@@ -1423,11 +1421,82 @@ class TestAutoRecallQuery:
 
         assert query == (
             "Current user message:\nAh shit\n\n"
-            "Immediate conversation context:\n"
+            "Recent conversation context:\n"
+            "User:\nFirst short message.\n\n"
+            "Assistant:\nFirst final answer.\n\n"
             "User:\nThe planner sounds useful.\n\n"
             "Assistant:\nIt changes almost 3,000 lines."
         )
-        assert "older" not in query.lower()
+
+    def test_includes_steering_as_user_text_but_excludes_tool_payload(self):
+        from agent.memory_provider import build_auto_recall_query
+        from agent.prompt_builder import format_steer_marker
+
+        query = build_auto_recall_query(
+            "Did that work?",
+            [
+                {"role": "user", "content": "Try option A."},
+                {"role": "assistant", "content": "I will inspect it.", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "SECRET TOOL NOISE" + format_steer_marker("No, use option B.")},
+                {"role": "assistant", "content": "Option B is now implemented."},
+            ],
+        )
+
+        assert "User:\nNo, use option B." in query
+        assert "SECRET TOOL NOISE" not in query
+        assert "OUT-OF-BAND USER MESSAGE" not in query
+        assert "I will inspect it." not in query
+        assert "Assistant:\nOption B is now implemented." in query
+
+    def test_newest_messages_win_when_context_budget_is_full(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "Current",
+            [
+                {"role": "user", "content": "OLDEST " + "o" * 500},
+                {"role": "assistant", "content": "MIDDLE " + "m" * 700},
+                {"role": "user", "content": "NEWEST " + "n" * 700},
+            ],
+        )
+
+        assert "NEWEST" in query
+        assert "MIDDLE" in query
+        assert "OLDEST" not in query
+
+    def test_many_tiny_messages_respect_hard_total_limit(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "c" * 2_000,
+            [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": "x"}
+                for i in range(500)
+            ],
+        )
+
+        assert len(query) <= 2_100
+        assert len(query.split("\n\nRecent conversation context:\n", 1)[0].removeprefix(
+            "Current user message:\n"
+        )) == 800
+
+    def test_synthetic_and_compaction_messages_are_excluded(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "Current",
+            [
+                {"role": "user", "content": "[System: Your previous response was truncated"},
+                {"role": "assistant", "content": "COMPACTED", "_compressed_summary": True},
+                {"role": "user", "content": "REAL USER"},
+                {"role": "assistant", "content": "REAL FINAL"},
+            ],
+        )
+
+        assert "previous response was truncated" not in query
+        assert "COMPACTED" not in query
+        assert "REAL USER" in query
+        assert "REAL FINAL" in query
 
     def test_runtime_envelopes_and_code_blocks_are_removed(self):
         from agent.memory_provider import build_auto_recall_query

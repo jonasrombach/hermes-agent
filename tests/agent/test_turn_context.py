@@ -292,11 +292,11 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
-def test_prefetch_uses_one_prior_conversation_round():
+def test_prefetch_uses_recent_eligible_conversation_messages():
     agent, mm = _agent_with_memory_manager()
     history = [
-        {"role": "user", "content": "Old unrelated topic"},
-        {"role": "assistant", "content": "Old unrelated answer"},
+        {"role": "user", "content": "An earlier short message."},
+        {"role": "assistant", "content": "An earlier final answer."},
         {"role": "user", "content": "The recall planner is nearly 3,000 lines."},
         {"role": "assistant", "content": "That would be over-engineered for us."},
     ]
@@ -307,7 +307,8 @@ def test_prefetch_uses_one_prior_conversation_round():
     assert sent_query.startswith("Current user message:\nAh shit")
     assert "The recall planner is nearly 3,000 lines." in sent_query
     assert "That would be over-engineered for us." in sent_query
-    assert "Old unrelated" not in sent_query
+    assert "An earlier short message." in sent_query
+    assert "An earlier final answer." in sent_query
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

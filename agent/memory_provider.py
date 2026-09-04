@@ -90,6 +90,73 @@ TRIVIAL_PROMPT_RE = re.compile(
 _MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.DOTALL | re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _SYMBOL_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+_SYNTHETIC_USER_PREFIXES = (
+    "[System: Your previous response was truncated",
+    "[System: The previous response was cut off",
+    "[System: Your previous tool call",
+    "[Your active task list was preserved across context compression]",
+    "[IMPORTANT: Background process ",
+    "[CONTEXT COMPACTION]",
+)
+
+
+def _message_text(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return ""
+
+
+def _extract_steer_text(message: Dict[str, Any]) -> str:
+    if message.get("role") != "tool":
+        return ""
+    text = _message_text(message)
+    if not text:
+        return ""
+    try:
+        from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+    except Exception:
+        return ""
+    start = text.find(STEER_MARKER_OPEN)
+    if start == -1:
+        return ""
+    start += len(STEER_MARKER_OPEN)
+    end = text.find(STEER_MARKER_CLOSE, start)
+    if end == -1:
+        return ""
+    return text[start:end].strip()
+
+
+def _auto_recall_entry(message: Any) -> Optional[tuple[str, str]]:
+    if not isinstance(message, dict):
+        return None
+    if message.get("_compressed_summary"):
+        return None
+    role = message.get("role")
+    if role == "tool":
+        steer = _clean_auto_recall_text(_extract_steer_text(message))
+        return ("User", steer) if steer else None
+
+    text = _clean_auto_recall_text(_message_text(message))
+    if not text:
+        return None
+    if role == "user":
+        if (
+            text.startswith("/")
+            or text.startswith(_SYNTHETIC_USER_PREFIXES)
+            or any(key.endswith("_synthetic") and value for key, value in message.items())
+        ):
+            return None
+        return "User", text
+    if role == "assistant" and not message.get("tool_calls"):
+        return "Assistant", text
+    return None
 
 
 def _clean_auto_recall_text(text: Any) -> str:
@@ -115,7 +182,7 @@ def build_auto_recall_query(
     *,
     max_chars: int = 2100,
 ) -> str:
-    """Build an automatic recall query from the current turn and one prior round."""
+    """Build an automatic recall query from recent semantic conversation text."""
     if max_chars <= 0:
         return ""
     current = _head_tail(_clean_auto_recall_text(current_user_message), min(800, max_chars))
@@ -123,48 +190,38 @@ def build_auto_recall_query(
     if len(current_section) >= max_chars:
         return _head_tail(current_section, max_chars)
 
-    previous_assistant = ""
-    previous_user = ""
+    context_prefix = "\n\nRecent conversation context:\n"
+    available_total = max_chars - len(current_section) - len(context_prefix)
+    remaining_content = 1200
+    selected_reversed: List[tuple[str, str]] = []
+    rendered_size = 0
+
     for message in reversed(prior_messages):
-        role = message.get("role")
-        content = _clean_auto_recall_text(message.get("content"))
-        if not content:
+        entry = _auto_recall_entry(message)
+        if entry is None:
             continue
-        if not previous_assistant:
-            if role == "assistant":
-                previous_assistant = content
-            continue
-        if role == "user" and not content.startswith("/"):
-            previous_user = content
+        role, text = entry
+        separator_size = 2 if selected_reversed else 0
+        label_size = len(role) + 2  # ``Role:\n``
+        available_for_text = available_total - rendered_size - separator_size - label_size
+        excerpt_budget = min(remaining_content, available_for_text)
+        if excerpt_budget <= 0:
+            break
+        excerpt = _head_tail(text, excerpt_budget)
+        selected_reversed.append((role, excerpt))
+        rendered_size += separator_size + label_size + len(excerpt)
+        remaining_content -= len(excerpt)
+        if len(excerpt) < len(text) or remaining_content <= 0:
             break
 
-    if not previous_user or not previous_assistant:
+    if not selected_reversed:
         return current_section
 
-    context_prefix = "\n\nImmediate conversation context:\nUser:\n"
-    assistant_prefix = "\n\nAssistant:\n"
-    available = max_chars - len(current_section) - len(context_prefix) - len(assistant_prefix)
-    round_budget = min(1200, available)
-    if round_budget <= 0:
-        return current_section
-
-    assistant_budget = min(len(previous_assistant), 800, round_budget)
-    user_budget = min(len(previous_user), round_budget - assistant_budget)
-    remaining = round_budget - assistant_budget - user_budget
-    if remaining:
-        extra = min(len(previous_assistant) - assistant_budget, remaining)
-        assistant_budget += extra
-        remaining -= extra
-    if remaining:
-        user_budget += min(len(previous_user) - user_budget, remaining)
-
-    context = (
-        context_prefix
-        + _head_tail(previous_user, user_budget)
-        + assistant_prefix
-        + _head_tail(previous_assistant, assistant_budget)
+    chronological = reversed(selected_reversed)
+    rendered_context = "\n\n".join(
+        f"{role}:\n{text}" for role, text in chronological
     )
-    return current_section + context
+    return current_section + context_prefix + rendered_context
 
 
 def is_trivial_prompt(text: Optional[str]) -> bool:

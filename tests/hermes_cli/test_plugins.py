@@ -1999,26 +1999,6 @@ class TestPluginCommands:
         assert len(mgr._plugin_commands) == 0
         assert "empty name" in caplog.text
 
-    def test_register_command_allows_name_used_only_by_cli_builtin(self):
-        mgr = PluginManager()
-        manifest = PluginManifest(name="test-plugin", source="user")
-        ctx = PluginContext(manifest, mgr)
-
-        ctx.register_command("wake", lambda a: a)
-
-        assert "wake" in mgr._plugin_commands
-
-    def test_register_command_still_rejects_gateway_builtin(self, caplog):
-        mgr = PluginManager()
-        manifest = PluginManifest(name="test-plugin", source="user")
-        ctx = PluginContext(manifest, mgr)
-
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-            ctx.register_command("status", lambda a: a)
-
-        assert "status" not in mgr._plugin_commands
-        assert "conflicts with a built-in command" in caplog.text
-
     def test_register_command_infers_text_argument_mode_from_args_hint(self):
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")

@@ -464,6 +464,15 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _mark_private_turn_messages(messages: List[Dict], *, start_index: int) -> None:
+    """Stamp only the active private turn so automatic recall excludes it."""
+    if not isinstance(start_index, int) or start_index < 0:
+        return
+    for message in messages[start_index:]:
+        if isinstance(message, dict):
+            message["hermes_private_turn"] = True
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -2260,6 +2269,11 @@ class AIAgent:
 
         def _persist_and_drain() -> None:
             self._drop_trailing_empty_response_scaffolding(messages)
+            if getattr(self, "_gateway_private_turn", False):
+                _mark_private_turn_messages(
+                    messages,
+                    start_index=getattr(self, "_persist_user_message_idx", -1),
+                )
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
@@ -2378,6 +2392,11 @@ class AIAgent:
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
             return None
+        if getattr(self, "_gateway_private_turn", False):
+            _mark_private_turn_messages(
+                messages,
+                start_index=getattr(self, "_persist_user_message_idx", -1),
+            )
         if not self._session_db:
             return None
         # Persist user-message override (#48677 chokepoint): historically this
@@ -4966,7 +4985,7 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or getattr(self, "_gateway_private_turn", False):
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

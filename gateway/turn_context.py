@@ -42,6 +42,7 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    private_turn: bool = False
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None

@@ -3283,6 +3283,10 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # One private plugin turn may wait behind an active session.  Keep it
+        # separate from ordinary pending input so an ordinary follow-up always
+        # remains the next turn.
+        self._pending_private_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
@@ -6195,6 +6199,7 @@ class BasePlatformAdapter(ABC):
         )
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        getattr(self, "_pending_private_messages", {}).pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -6278,6 +6283,7 @@ class BasePlatformAdapter(ABC):
                 )
         if discard_pending:
             self._pending_messages.pop(session_key, None)
+            getattr(self, "_pending_private_messages", {}).pop(session_key, None)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -6294,7 +6300,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self.get_pending_message(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -6429,6 +6435,24 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # Private plugin turns must never enter the active turn's busy
+            # handler: that path can steer or interrupt ordinary user input.
+            # One separate slot preserves their boundary while leaving the
+            # ordinary pending slot first in the existing drain order.
+            private_turn = bool(
+                (event.metadata or {}).get("hermes_private_turn")
+                or getattr(event.source, "_hermes_private_turn", False)
+            )
+            if private_turn:
+                pending_private = getattr(self, "_pending_private_messages", None)
+                if pending_private is None:
+                    pending_private = {}
+                    self._pending_private_messages = pending_private
+                if session_key in pending_private:
+                    return False
+                pending_private[session_key] = event
+                return True
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -7193,9 +7217,11 @@ class BasePlatformAdapter(ABC):
             # this task hand off the follow-up.
             await self._flush_text_debounce_now(session_key)
 
-            # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            # Check if there's a pending message that was queued during our processing.
+            # get_pending_message drains ordinary input before the one waiting
+            # private turn.
+            pending_event = self.get_pending_message(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -7326,7 +7352,7 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = self.get_pending_message(session_key)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -7462,6 +7488,7 @@ class BasePlatformAdapter(ABC):
         except Exception:
             pass
         self._pending_messages.clear()
+        getattr(self, "_pending_private_messages", {}).clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
@@ -7473,8 +7500,15 @@ class BasePlatformAdapter(ABC):
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
-        """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        """Get and clear the next pending turn for a session.
+
+        Ordinary input owns the existing pending slot and therefore wins over
+        one private plugin turn waiting at the same boundary.
+        """
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            return pending
+        return getattr(self, "_pending_private_messages", {}).pop(session_key, None)
     
     def build_source(
         self,

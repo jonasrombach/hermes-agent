@@ -220,6 +220,10 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Fired once by a running gateway after its injection-capable adapters and
+    # live plugin message injector are available. Observer callbacks may return
+    # a task for the gateway lifecycle to own and cancel during shutdown.
+    "gateway_ready",
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
@@ -1191,6 +1195,13 @@ class RenderedPluginSystemPromptSection:
 
 
 @dataclass(frozen=True)
+class PluginCommandContext:
+    """Immutable gateway conversation identity for a plugin slash command."""
+
+    session_key: str
+
+
+@dataclass(frozen=True)
 class _EventSubscription:
     """Host-owned subscription ledger entry."""
 
@@ -2049,6 +2060,8 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        private: bool = False,
+        on_dispatch_result: Callable[[bool], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -2060,11 +2073,32 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        ``private=True`` marks the injected turn as private for downstream
+        gateway handling. ``on_dispatch_result`` is called by the gateway once
+        asynchronous dispatch is accepted or rejected; callback failures are
+        isolated.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
 
         Returns True if the message was queued successfully.
         """
+        result_reported = False
+
+        def _report_result(result: bool) -> None:
+            nonlocal result_reported
+            if result_reported:
+                return
+            result_reported = True
+            if on_dispatch_result is None:
+                return
+            try:
+                on_dispatch_result(bool(result))
+            except Exception:
+                logger.warning(
+                    "inject_message: dispatch result callback failed",
+                    exc_info=True,
+                )
+
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
 
@@ -2075,12 +2109,14 @@ class PluginContext:
             else:
                 # Agent is idle - queue as next input
                 cli._pending_input.put(msg)
+            _report_result(False)
             return True
 
         if not session_key:
             logger.warning(
                 "inject_message: gateway mode requires an existing session_key"
             )
+            _report_result(False)
             return False
         if not self._gateway_injection_allowed():
             plugin_id = self.manifest.key or self.manifest.name
@@ -2090,27 +2126,37 @@ class PluginContext:
                 plugin_id,
                 plugin_id,
             )
+            _report_result(False)
             return False
 
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
+            _report_result(False)
             return False
 
         plugin_id = self.manifest.key or self.manifest.name
         try:
-            return bool(
-                self._manager.inject_gateway_message(
-                    session_key=session_key,
-                    content=msg,
-                    plugin_id=plugin_id,
-                )
-            )
+            injection_kwargs: Dict[str, Any] = {
+                "session_key": session_key,
+                "content": msg,
+                "plugin_id": plugin_id,
+            }
+            if private:
+                injection_kwargs["private"] = True
+            if on_dispatch_result is not None:
+                injection_kwargs["on_dispatch_result"] = _report_result
+            accepted = bool(self._manager.inject_gateway_message(**injection_kwargs))
+            if not accepted:
+                # The injector may disappear after the availability check.
+                _report_result(False)
+            return accepted
         except Exception:
             logger.warning(
                 "inject_message: gateway scheduling failed for plugin %s",
                 plugin_id,
                 exc_info=True,
             )
+            _report_result(False)
             return False
 
     def _gateway_injection_allowed(self) -> bool:
@@ -2186,8 +2232,11 @@ class PluginContext:
     ) -> Optional[PluginRegistration]:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
-        It may also be an async callable — the gateway dispatch handles both.
+        The handler signature is ``fn(raw_args: str) -> str | None`` or
+        ``fn(raw_args: str, command_context: PluginCommandContext) -> str | None``.
+        The optional context is supplied by the gateway only and contains the
+        stable key for the authorized invoking conversation. It may also be an
+        async callable — the gateway dispatch handles both.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
         terminal commands), this registers in-session slash commands that users
@@ -2206,6 +2255,7 @@ class PluginContext:
 
         Names conflicting with built-in commands are rejected with a warning.
         """
+        _plugin_command_accepts_context(handler)
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning(
@@ -7057,6 +7107,53 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def _plugin_command_accepts_context(handler: Callable) -> bool:
+    """Validate a slash-command handler and return whether it opts into context."""
+    if not callable(handler):
+        raise TypeError("Plugin command handler must be callable")
+    try:
+        signature = inspect.signature(handler)
+        parameters = signature.parameters.values()
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "Plugin command handler must have one or two positional arguments"
+        ) from exc
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(positional) not in {1, 2}:
+        raise TypeError(
+            "Plugin command handler must have one or two positional arguments"
+        )
+    required_keyword_only = [
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+    ]
+    if required_keyword_only:
+        raise TypeError(
+            "Plugin command handler must not require keyword-only arguments"
+        )
+    return len(positional) == 2
+
+
+def invoke_plugin_command(
+    handler: Callable,
+    raw_args: str,
+    command_context: PluginCommandContext,
+) -> Any:
+    """Invoke a validated plugin command without treating handler errors as arity errors."""
+    if _plugin_command_accepts_context(handler):
+        return handler(raw_args, command_context)
+    return handler(raw_args)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

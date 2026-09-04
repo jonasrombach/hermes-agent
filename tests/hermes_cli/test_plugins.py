@@ -2010,6 +2010,17 @@ class TestPluginCommands:
         assert mgr._plugin_commands["lcm"]["argument_mode"] == "text"
         assert mgr._plugin_commands["ping"]["argument_mode"] is None
 
+    def test_register_command_rejects_unsupported_handler_signature(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        with pytest.raises(TypeError, match="one or two positional arguments"):
+            ctx.register_command(
+                "invalid",
+                lambda raw_args, command_context, unsupported: raw_args,
+            )
+
 
 
 

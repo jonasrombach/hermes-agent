@@ -183,6 +183,53 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
 
 
 @pytest.mark.asyncio
+async def test_private_dispatch_marks_event_without_mutating_stored_origin():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        content="private background turn",
+        plugin_id="notify-plugin",
+        private=True,
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["hermes_private_turn"] is True
+    assert event.source is not entry.origin
+    assert getattr(event.source, "_hermes_private_turn") is True
+    assert not hasattr(entry.origin, "_hermes_private_turn")
+
+
+def test_private_turn_marker_survives_telegram_topic_source_recovery():
+    """The authoritative event marker survives dataclasses.replace() recovery."""
+    from gateway.run import _restore_private_turn_source_after_recovery
+
+    entry = _entry()
+    source = entry.origin
+    assert source is not None
+    event = MessageEvent(
+        text="private wake",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    recovered = _restore_private_turn_source_after_recovery(
+        event,
+        source,
+        thread_id="recovered-topic",
+    )
+
+    assert recovered.thread_id == "recovered-topic"
+    assert event.source is recovered
+    assert getattr(recovered, "_hermes_private_turn") is True
+    assert event.metadata["hermes_private_turn"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entry", "with_adapter"),
     [
@@ -293,6 +340,172 @@ async def test_dispatch_stops_when_gateway_drains_during_lookup():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rechecks_pinned_session_at_adapter_acceptance():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=True))
+    original = _entry()
+    moved = _entry()
+    moved.session_id = "session-43"
+    runner = _runner(original, adapter)
+    runner._async_session_store.lookup_by_session_key = AsyncMock(
+        side_effect=[original, moved]
+    )
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=original.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    accepted = await task
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_in_place_session_id_change_before_adapter_acceptance():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=True))
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    lookup_count = 0
+
+    async def _lookup(_session_key):
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 2:
+            entry.session_id = "session-43"
+        return entry
+
+    runner._async_session_store.lookup_by_session_key = _lookup
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    accepted = await task
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_missing_routing_once():
+    runner = _runner(None, SimpleNamespace(handle_message=AsyncMock()))
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    assert await task is False
+
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_stale_routing_once():
+    original = _entry()
+    runner = _runner(original, SimpleNamespace(handle_message=AsyncMock()))
+    runner._async_session_store.lookup_by_session_key = AsyncMock(
+        side_effect=[original, None]
+    )
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=original.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    assert await task is False
+
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_authorization_failure_once():
+    runner = _runner(_entry(), SimpleNamespace(handle_message=AsyncMock()))
+    runner._is_user_authorized.return_value = False
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    assert await task is False
+
+    receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_changed_origin_before_adapter_acceptance():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=True))
+    original = _entry()
+    moved = _entry()
+    assert moved.origin is not None
+    moved.origin.chat_id = "99"
+    runner = _runner(original, adapter)
+    runner._async_session_store.lookup_by_session_key = AsyncMock(
+        side_effect=[original, moved]
+    )
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=original.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_in_place_origin_change_before_adapter_acceptance():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=True))
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    lookup_count = 0
+
+    async def _lookup(_session_key):
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 2:
+            entry.origin.chat_id = "99"
+        return entry
+
+    runner._async_session_store.lookup_by_session_key = _lookup
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     adapter = _RoutingAdapter()
     adapter.set_message_handler(AsyncMock())
@@ -313,6 +526,209 @@ async def test_base_adapter_queues_non_control_plugin_text_for_exact_session():
     adapter._message_handler.assert_not_awaited()
     assert adapter._pending_messages[session_key] is event
     assert adapter._active_sessions[session_key].is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_private_plugin_event_waits_for_turn_boundary_without_busy_handler():
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    source = _entry().origin
+    session_key = build_session_key(source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    busy_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(busy_handler)
+    event = MessageEvent(
+        text="private wake",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={
+            "gateway_session_key": session_key,
+            "gateway_session_strict": True,
+            "hermes_private_turn": True,
+        },
+    )
+
+    assert await adapter.handle_message(event) is True
+
+    busy_handler.assert_not_awaited()
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._pending_private_messages[session_key] is event
+    assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_ordinary_pending_event_drains_before_private_plugin_event():
+    adapter = _RoutingAdapter()
+    source = _entry().origin
+    session_key = build_session_key(source)
+    ordinary = MessageEvent(text="ordinary", source=source)
+    private = MessageEvent(
+        text="private wake",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_private_turn": True},
+    )
+    adapter._pending_messages[session_key] = ordinary
+    adapter._pending_private_messages[session_key] = private
+
+    assert adapter.get_pending_message(session_key) is ordinary
+    assert adapter.get_pending_message(session_key) is private
+    assert adapter.get_pending_message(session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_second_private_plugin_event_is_rejected_without_merging_or_busy_ack():
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    first_receipt = MagicMock()
+    second_receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key,
+        content="first private wake",
+        plugin_id="notify-plugin",
+        private=True,
+        on_dispatch_result=first_receipt,
+    ) is True
+    first_task = next(iter(runner._background_tasks))
+    assert await first_task is True
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key,
+        content="second private wake",
+        plugin_id="notify-plugin",
+        private=True,
+        on_dispatch_result=second_receipt,
+    ) is True
+    second_task = next(task for task in runner._background_tasks if task is not first_task)
+    assert await second_task is False
+
+    assert adapter._pending_private_messages[entry.session_key].text == "first private wake"
+    first_receipt.assert_called_once_with(True)
+    second_receipt.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_waiting_private_event_dispatches_with_private_and_strict_metadata():
+    adapter = _RoutingAdapter()
+    adapter.config.typing_indicator = False
+    source = _entry().origin
+    session_key = build_session_key(source)
+    current_started = asyncio.Event()
+    release_current = asyncio.Event()
+    seen = []
+
+    async def handler(event):
+        seen.append(event)
+        if event.text == "current turn":
+            current_started.set()
+            await release_current.wait()
+        return None
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(MessageEvent(text="current turn", source=source))
+    await asyncio.wait_for(current_started.wait(), timeout=1)
+    private = MessageEvent(
+        text="private wake",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={
+            "hermes_private_turn": True,
+            "gateway_session_key": session_key,
+            "gateway_session_id": "session-42",
+            "gateway_session_strict": True,
+        },
+    )
+
+    assert await adapter.handle_message(private) is True
+    release_current.set()
+    for _ in range(100):
+        if len(seen) == 2 and session_key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.01)
+
+    assert [event.text for event in seen] == ["current turn", "private wake"]
+    assert seen[1] is private
+    assert seen[1].metadata["hermes_private_turn"] is True
+    assert seen[1].metadata["gateway_session_strict"] is True
+    assert seen[1].metadata["gateway_session_id"] == "session-42"
+
+
+@pytest.mark.asyncio
+async def test_sequential_private_turn_releases_latches_without_overlap():
+    adapter = _RoutingAdapter()
+    adapter.config.typing_indicator = False
+    source = _entry().origin
+    session_key = build_session_key(source)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    running = 0
+    max_running = 0
+    seen = []
+
+    async def handler(event):
+        nonlocal running, max_running
+        running += 1
+        max_running = max(max_running, running)
+        seen.append(event.text)
+        try:
+            if event.text == "first":
+                first_started.set()
+                await release_first.wait()
+        finally:
+            running -= 1
+        return None
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(MessageEvent(text="first", source=source))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    private = MessageEvent(
+        text="private second",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_private_turn": True},
+    )
+    assert await adapter.handle_message(private) is True
+    release_first.set()
+    for _ in range(100):
+        if seen == ["first", "private second"] and session_key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.01)
+
+    assert seen == ["first", "private second"]
+    assert max_running == 1
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+
+
+@pytest.mark.asyncio
+async def test_non_private_busy_event_keeps_existing_pending_slot_behavior():
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    source = _entry().origin
+    session_key = build_session_key(source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    event = MessageEvent(
+        text="ordinary plugin event",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"gateway_session_key": session_key},
+    )
+
+    await adapter.handle_message(event)
+
+    assert adapter._pending_messages[session_key] is event
+    assert session_key not in adapter._pending_private_messages
 
 
 @pytest.mark.asyncio
@@ -357,6 +773,91 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
 
 
 @pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_adapter_acceptance_once():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=True))
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await task
+    assert receipt.call_args_list == [((True,), {})]
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_adapter_rejection_once():
+    adapter = SimpleNamespace(handle_message=AsyncMock(return_value=False))
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key=entry.session_key,
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await task
+    assert receipt.call_args_list == [((False,), {})]
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_cancellation_once():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    blocked = asyncio.Event()
+
+    async def _blocked_dispatch(**_kwargs):
+        await blocked.wait()
+
+    runner._dispatch_plugin_message_injection = _blocked_dispatch
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert receipt.call_args_list == [((False,), {})]
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_callback_exception_is_isolated():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    receipt = MagicMock(side_effect=RuntimeError("receipt failed"))
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="key",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+
+    task = next(iter(runner._background_tasks))
+    await task
+    receipt.assert_called_once_with(True)
+
+
+@pytest.mark.asyncio
 async def test_scheduler_ignores_same_loop_task_cancellation():
     runner = _runner(_entry())
     loop = asyncio.get_running_loop()
@@ -390,6 +891,27 @@ async def test_scheduler_ignores_same_loop_task_cancellation():
         loop.set_exception_handler(previous_handler)
 
     assert callback_errors == []
+
+
+@pytest.mark.asyncio
+async def test_plugin_dispatch_receipt_reports_adapter_exception_once():
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=RuntimeError("adapter failed"))
+    )
+    runner = _runner(_entry(), adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    receipt = MagicMock()
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        on_dispatch_result=receipt,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    assert await task is False
+
+    receipt.assert_called_once_with(False)
 
 
 @pytest.mark.asyncio
@@ -537,6 +1059,50 @@ def test_scheduler_rejects_submission_failure():
             )
             is False
         )
+
+
+def test_scheduler_receipt_reports_submission_failure_once():
+    runner = _runner(_entry())
+    loop = MagicMock()
+    loop.is_closed.return_value = False
+    runner._gateway_loop = loop
+    receipt = MagicMock()
+
+    def _reject(coro, _target_loop, **_kwargs):
+        coro.close()
+        return None
+
+    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_reject):
+        assert runner._schedule_plugin_message_injection(
+            session_key="key",
+            content="wake up",
+            plugin_id="notify-plugin",
+            on_dispatch_result=receipt,
+        ) is False
+
+    receipt.assert_called_once_with(False)
+
+
+def test_scheduler_receipt_reports_submission_exception_once():
+    runner = _runner(_entry())
+    loop = MagicMock()
+    loop.is_closed.return_value = False
+    runner._gateway_loop = loop
+    receipt = MagicMock()
+
+    def _raise(coro, _target_loop, **_kwargs):
+        coro.close()
+        raise RuntimeError("loop bridge failed")
+
+    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_raise):
+        assert runner._schedule_plugin_message_injection(
+            session_key="key",
+            content="wake up",
+            plugin_id="notify-plugin",
+            on_dispatch_result=receipt,
+        ) is False
+
+    receipt.assert_called_once_with(False)
 
 
 def test_install_and_clear_gateway_injector_preserves_newer_owner():

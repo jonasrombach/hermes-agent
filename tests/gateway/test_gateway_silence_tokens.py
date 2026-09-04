@@ -119,6 +119,58 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
 
 
 @pytest.mark.asyncio
+async def test_private_turn_never_returns_raw_model_final(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "raw private model output",
+        "messages": [
+            {"role": "user", "content": "private wake", "hermes_private_turn": True},
+            {"role": "assistant", "content": "raw private model output", "hermes_private_turn": True},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "completed": True,
+        "failed": False,
+    })
+    event = _event()
+    event.metadata = {"hermes_private_turn": True}
+
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+
+
+@pytest.mark.asyncio
+async def test_private_turn_returns_only_existing_transform_hook_output(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "validated completion",
+        "response_transformed": True,
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "completed": True,
+        "failed": False,
+        "interrupted": False,
+        "partial": False,
+    })
+    event = _event()
+    event.metadata = {"hermes_private_turn": True}
+
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == "validated completion"
+
+
+@pytest.mark.asyncio
 async def test_empty_success_still_gets_empty_response_warning(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={

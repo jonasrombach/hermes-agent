@@ -136,6 +136,8 @@ def _extract_steer_text(message: Dict[str, Any]) -> str:
 def _auto_recall_entry(message: Any) -> Optional[tuple[str, str]]:
     if not isinstance(message, dict):
         return None
+    if message.get("hermes_private_turn"):
+        return None
     if message.get("_compressed_summary"):
         return None
     role = message.get("role")

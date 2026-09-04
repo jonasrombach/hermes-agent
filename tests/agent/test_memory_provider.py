@@ -1517,6 +1517,36 @@ class TestAutoRecallQuery:
         assert "/restart" not in query
         assert "Back online." in query
 
+    def test_private_turn_user_assistant_and_tool_content_are_excluded(self):
+        from agent.memory_provider import build_auto_recall_query
+
+        query = build_auto_recall_query(
+            "ordinary current message",
+            [
+                {
+                    "role": "user",
+                    "content": "PRIVATE USER CONTENT",
+                    "hermes_private_turn": True,
+                },
+                {
+                    "role": "assistant",
+                    "content": "PRIVATE ASSISTANT CONTENT",
+                    "hermes_private_turn": True,
+                },
+                {
+                    "role": "tool",
+                    "content": "PRIVATE TOOL CONTENT",
+                    "hermes_private_turn": True,
+                },
+                {"role": "assistant", "content": "ordinary assistant content"},
+            ],
+        )
+
+        assert "PRIVATE USER CONTENT" not in query
+        assert "PRIVATE ASSISTANT CONTENT" not in query
+        assert "PRIVATE TOOL CONTENT" not in query
+        assert "ordinary assistant content" in query
+
     def test_total_limit_prioritizes_current_message(self):
         from agent.memory_provider import build_auto_recall_query
 

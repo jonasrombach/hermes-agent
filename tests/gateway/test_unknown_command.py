@@ -225,3 +225,81 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_legacy_handler_receives_only_raw_args(monkeypatch):
+    """Existing one-argument plugin handlers keep their exact invocation."""
+    from hermes_cli import plugins as plugins_mod
+
+    runner = _make_runner()
+    calls = []
+
+    def handler(raw_args):
+        calls.append(raw_args)
+        return "legacy output"
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "legacy" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/legacy raw payload"))
+
+    assert result == "legacy output"
+    assert calls == ["raw payload"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_receives_invoking_stable_session_key(monkeypatch):
+    """Gateway command context is limited to the current routed session key."""
+    from hermes_cli import plugins as plugins_mod
+
+    runner = _make_runner()
+    runner.__dict__["_last_active_session_key"] = "telegram:dm:historical-conversation"
+    observed = []
+
+    def handler(raw_args, command_context):
+        observed.append((raw_args, command_context))
+        return "bound"
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "bind" else None,
+    )
+    source = _make_source()
+    source.chat_id = "invoking-chat"
+    event = MessageEvent(text="/bind now", source=source, message_id="m1")
+
+    result = await runner._handle_message(event)
+
+    assert result == "bound"
+    assert len(observed) == 1
+    raw_args, command_context = observed[0]
+    assert raw_args == "now"
+    assert vars(command_context) == {"session_key": build_session_key(source)}
+    assert command_context.session_key != runner._last_active_session_key
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_internal_type_error_is_not_retried_as_arity_fallback(monkeypatch):
+    """A TypeError raised by a two-argument handler runs once, not as fallback."""
+    from hermes_cli import plugins as plugins_mod
+
+    runner = _make_runner()
+    calls = []
+
+    def handler(raw_args, command_context):
+        calls.append((raw_args, command_context.session_key))
+        raise TypeError("plugin body failure")
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "type-error" else None,
+    )
+
+    await runner._handle_message(_make_event("/type-error payload"))
+
+    assert calls == [("payload", build_session_key(_make_source()))]

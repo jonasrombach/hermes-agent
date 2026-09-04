@@ -55,10 +55,38 @@ class TestSyncExternalMemoryForTurn:
         agent._memory_manager.queue_prefetch_all.assert_not_called()
 
 
-    # --- Normal completed turn still syncs ------------------------------
+    # --- Private-turn and ordinary completion guards --------------------
 
+    def test_private_turn_does_not_sync_or_prefetch(self):
+        agent = _bare_agent()
+        agent._gateway_private_turn = True
 
+        agent._sync_external_memory_for_turn(
+            original_user_message="PRIVATE USER CONTENT",
+            final_response="PRIVATE ASSISTANT CONTENT",
+            interrupted=False,
+            messages=[
+                {"role": "user", "content": "PRIVATE USER CONTENT"},
+                {"role": "assistant", "content": "PRIVATE ASSISTANT CONTENT"},
+                {"role": "tool", "content": "PRIVATE TOOL CONTENT"},
+            ],
+        )
 
+        agent._memory_manager.sync_all.assert_not_called()
+        agent._memory_manager.queue_prefetch_all.assert_not_called()
+
+    def test_normal_completed_turn_still_syncs(self):
+        agent = _bare_agent()
+        agent._gateway_private_turn = False
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="ordinary user content",
+            final_response="ordinary assistant content",
+            interrupted=False,
+        )
+
+        agent._memory_manager.sync_all.assert_called_once()
+        agent._memory_manager.queue_prefetch_all.assert_called_once()
 
     # --- Edge cases (pre-existing behaviour preserved) ------------------
 

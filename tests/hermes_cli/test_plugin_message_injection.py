@@ -52,6 +52,36 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
     assert cli._pending_input.empty()
 
 
+def test_cli_injection_receipt_rejects_adapter_acceptance_claim():
+    context, manager = _context()
+    cli = SimpleNamespace(
+        _agent_running=False,
+        _pending_input=SimpleQueue(),
+        _interrupt_queue=SimpleQueue(),
+    )
+    manager._cli_ref = cli
+    receipt = MagicMock()
+
+    assert context.inject_message("new input", on_dispatch_result=receipt) is True
+
+    receipt.assert_called_once_with(False)
+
+
+def test_cli_injection_receipt_exception_is_isolated():
+    context, manager = _context()
+    cli = SimpleNamespace(
+        _agent_running=False,
+        _pending_input=SimpleQueue(),
+        _interrupt_queue=SimpleQueue(),
+    )
+    manager._cli_ref = cli
+    receipt = MagicMock(side_effect=RuntimeError("receipt failed"))
+
+    assert context.inject_message("new input", on_dispatch_result=receipt) is True
+    assert cli._pending_input.get_nowait() == "new input"
+    receipt.assert_called_once_with(False)
+
+
 def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,
@@ -164,6 +194,35 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
     )
 
 
+def test_gateway_injection_forwards_private_receipt_callback(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    receipt = MagicMock()
+
+    assert context.inject_message(
+        "wake up",
+        session_key="agent:main:telegram:dm:42",
+        private=True,
+        on_dispatch_result=receipt,
+    ) is True
+
+    injector.assert_called_once()
+    forwarded = injector.call_args.kwargs
+    assert forwarded["session_key"] == "agent:main:telegram:dm:42"
+    assert forwarded["content"] == "wake up"
+    assert forwarded["plugin_id"] == "notify-plugin"
+    assert forwarded["private"] is True
+    assert forwarded["on_dispatch_result"] is not receipt
+    forwarded["on_dispatch_result"](True)
+    receipt.assert_called_once_with(True)
+
+
 def test_gateway_injection_returns_host_rejection(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,
@@ -202,3 +261,57 @@ def test_gateway_injection_fails_closed_on_host_exception(tmp_path, monkeypatch)
         )
         is False
     )
+
+
+def test_gateway_injection_reports_injector_race_rejection_once(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    owner = object()
+    manager.set_gateway_message_injector(owner, MagicMock(return_value=True))
+    receipt = MagicMock()
+    original_inject = manager.inject_gateway_message
+
+    def disappear_then_inject(**kwargs):
+        manager.clear_gateway_message_injector(owner)
+        return original_inject(**kwargs)
+
+    with patch.object(
+        manager,
+        "inject_gateway_message",
+        side_effect=disappear_then_inject,
+    ):
+        assert context.inject_message(
+            "wake up",
+            session_key="agent:main:telegram:dm:42",
+            on_dispatch_result=receipt,
+        ) is False
+
+    receipt.assert_called_once_with(False)
+
+
+def test_gateway_injection_does_not_duplicate_downstream_receipt(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    receipt = MagicMock()
+
+    def injector(**kwargs):
+        kwargs["on_dispatch_result"](False)
+        return False
+
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "wake up",
+        session_key="agent:main:telegram:dm:42",
+        on_dispatch_result=receipt,
+    ) is False
+
+    receipt.assert_called_once_with(False)

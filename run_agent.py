@@ -2271,6 +2271,12 @@ class AIAgent:
             self._drop_trailing_empty_response_scaffolding(messages)
             if getattr(self, "_gateway_private_turn", False):
                 start_index = getattr(self, "_persist_user_message_idx", -1)
+                if not isinstance(start_index, int) or start_index < 0:
+                    start_index = (
+                        len(conversation_history)
+                        if isinstance(conversation_history, list)
+                        else 0
+                    )
                 # Stamp the tail before discarding it from the cache.  The
                 # marker is message-local and therefore survives a later
                 # mutation of the cached agent's turn-wide privacy flag (for
@@ -2360,9 +2366,16 @@ class AIAgent:
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         if getattr(self, "_gateway_private_turn", False):
+            start_index = getattr(self, "_persist_user_message_idx", -1)
+            if not isinstance(start_index, int) or start_index < 0:
+                start_index = (
+                    len(conversation_history)
+                    if isinstance(conversation_history, list)
+                    else 0
+                )
             _mark_private_turn_messages(
                 messages,
-                start_index=getattr(self, "_persist_user_message_idx", -1),
+                start_index=start_index,
             )
             return None
         persist_lock = getattr(self, "_session_persist_lock", None)

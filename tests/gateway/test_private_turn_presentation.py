@@ -68,6 +68,25 @@ def test_private_turn_direct_flush_marks_tail_before_skipping_db():
     assert private_tool["hermes_private_turn"] is True
 
 
+def test_private_turn_invalid_start_index_falls_back_to_history_boundary():
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._gateway_private_turn = True
+    agent._persist_user_message_idx = None
+    agent._session_persist_lock = None
+    agent._flush_messages_to_session_db_unlocked = MagicMock()
+
+    history = {"role": "assistant", "content": "ordinary history"}
+    private_user = {"role": "user", "content": "private wake"}
+    messages = [history, private_user]
+
+    assert agent._flush_messages_to_session_db(messages, [history]) is None
+
+    assert "hermes_private_turn" not in history
+    assert private_user["hermes_private_turn"] is True
+
+
 def test_later_public_flush_cannot_persist_a_stamped_private_tail(tmp_path):
     from run_agent import AIAgent
 

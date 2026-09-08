@@ -4730,6 +4730,30 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+class _GatewayTurnResult(dict):
+    """Result whose private-turn provenance was stamped by the gateway."""
+
+
+def _stamp_gateway_turn_result(result: Any, private_turn: bool) -> Any:
+    """Attach unspoofable final/chain provenance at the gateway boundary."""
+    if not isinstance(result, dict):
+        return result
+    trusted = isinstance(result, _GatewayTurnResult)
+    stamped = _GatewayTurnResult(result)
+    stamped["_gateway_private_turn"] = (
+        bool(result.get("_gateway_private_turn")) if trusted else private_turn
+    )
+    stamped["_gateway_chain_has_private_turn"] = (
+        private_turn
+        or (
+            bool(result.get("_gateway_chain_has_private_turn"))
+            if trusted
+            else False
+        )
+    )
+    return stamped
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -4757,7 +4781,11 @@ def _preserve_queued_followup_history_offset(
     if isinstance(followup_offset, int) and followup_offset <= current_offset:
         return followup_result
 
-    merged = dict(followup_result)
+    merged = (
+        _GatewayTurnResult(followup_result)
+        if isinstance(followup_result, _GatewayTurnResult)
+        else dict(followup_result)
+    )
     merged["history_offset"] = current_offset
     return merged
 
@@ -23418,7 +23446,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            if private_turn:
+            final_private_turn = bool(
+                agent_result.get("_gateway_private_turn", private_turn)
+            )
+            chain_has_private_turn = bool(
+                agent_result.get(
+                    "_gateway_chain_has_private_turn",
+                    private_turn or final_private_turn,
+                )
+            )
+            if final_private_turn:
                 response = ""
                 if (
                     agent_result.get("response_transformed")
@@ -23453,7 +23490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # produce visible content after exhausting all retries (nudge,
             # prefill, empty-retry, fallback).  Sending the raw sentinel
             # looks like a bug; a short explanation is more helpful.
-            if response == "(empty)" and not _intentional_silence and not private_turn:
+            if response == "(empty)" and not _intentional_silence and not final_private_turn:
                 response = (
                     "⚠️ The model returned no response after processing tool "
                     "results. This can happen with some models — try again or "
@@ -23496,7 +23533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
-            if not _intentional_silence and not private_turn:
+            if not _intentional_silence and not final_private_turn:
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
@@ -23558,7 +23595,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _show_reasoning_effective
                 and response
                 and not _intentional_silence
-                and not private_turn
+                and not final_private_turn
             ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
@@ -23623,13 +23660,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and response
                 and not agent_result.get("already_sent")
                 and not _intentional_silence
-                and not private_turn
+                and not final_private_turn
             ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook only for observable turns. ``hook_ctx`` carries
             # the raw inbound message and this payload carries the raw response.
-            if not private_turn:
+            if not chain_has_private_turn:
                 await self.hooks.emit("agent:end", {
                     **hook_ctx,
                     "response": (response or "")[:500],
@@ -23788,7 +23825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if private_turn:
+            if chain_has_private_turn:
                 pass  # private synthetic turns never enter the canonical transcript
             elif is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
@@ -23821,7 +23858,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if private_turn:
+            if chain_has_private_turn:
                 pass  # agent state and gateway transcript both exclude private turns
             elif is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
@@ -24001,7 +24038,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (
                 agent_result.get("already_sent")
                 and not agent_result.get("failed")
-                and not private_turn
+                and not final_private_turn
             ):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
@@ -31379,7 +31416,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         change for single-profile gateways.
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
+            result = await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
@@ -31391,21 +31428,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 private_turn=private_turn,
             )
-
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                inbound_message_id=inbound_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
-                private_turn=private_turn,
-            )
+        else:
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                result = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    inbound_message_id=inbound_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                    private_turn=private_turn,
+                )
+        return _stamp_gateway_turn_result(result, private_turn)
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -32974,7 +33012,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
-                    if _intentional_silence:
+                    if private_turn:
+                        logger.info(
+                            "Queued follow-up for session %s: suppressing private turn before continuing.",
+                            session_key or "?",
+                        )
+                    elif _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
@@ -33038,12 +33081,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_private_turn = False
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_private_turn = _is_private_turn_event(
+                        pending_event, next_source
+                    )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -33129,8 +33176,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    private_turn=next_private_turn,
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                return _preserve_queued_followup_history_offset(
+                    cast(dict, result), followup_result
+                )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
@@ -33423,7 +33473,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _rpe:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
-        return response
+        return cast(Dict[str, Any], response)
 
 
 def _run_planned_stop_watcher(

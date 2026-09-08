@@ -930,6 +930,28 @@ class QueuedSilenceAgent:
         }
 
 
+class MixedPrivacyQueueAgent:
+    """Expose distinct text for a private middle turn in a three-turn drain."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).calls += 1
+        responses = {
+            1: "NO_REPLY",
+            2: "PRIVATE MIDDLE RESPONSE",
+            3: "public final response",
+        }
+        return {
+            "final_response": responses[type(self).calls],
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1006,6 +1028,9 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    private_turn=False,
+    pending_private=False,
+    pending_private_sequence=None,
 ):
     if config_data:
         import yaml
@@ -1039,12 +1064,29 @@ async def _run_with_agent(
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
-        adapter._pending_messages[session_key] = MessageEvent(
+        pending_event = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+            metadata={"hermes_private_turn": True} if pending_private else {},
         )
+        if pending_private:
+            adapter._pending_private_messages[session_key] = pending_event
+        else:
+            adapter._pending_messages[session_key] = pending_event
+    if pending_private_sequence is not None:
+        queued_events = iter(
+            MessageEvent(
+                text=f"queued turn {index}",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=f"queued-{index}",
+                metadata={"hermes_private_turn": True} if is_private else {},
+            )
+            for index, is_private in enumerate(pending_private_sequence, start=1)
+        )
+        adapter.get_pending_message = lambda session_key: next(queued_events, None)
 
     result = await runner._run_agent(
         message="hello",
@@ -1053,6 +1095,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        private_turn=private_turn,
     )
     return adapter, result
 
@@ -1356,6 +1399,94 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
     assert QueuedSilenceAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert "NO_REPLY" not in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_private_turn_queued_user_followup_returns_public_turn_provenance(
+    monkeypatch, tmp_path,
+):
+    """The final result belongs to the ordinary queued turn, not its private parent."""
+    QueuedSilenceAgent.calls = 0
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSilenceAgent,
+        session_id="sess-private-queued-user",
+        pending_text="queued user follow-up",
+        private_turn=True,
+    )
+
+    assert QueuedSilenceAgent.calls == 2
+    assert result["final_response"] == "follow-up processed"
+    assert result["_gateway_private_turn"] is False
+
+
+@pytest.mark.asyncio
+async def test_public_turn_queued_private_followup_returns_private_turn_provenance(
+    monkeypatch, tmp_path,
+):
+    """A queued private turn must not inherit its public parent's delivery state."""
+    QueuedSilenceAgent.calls = 0
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSilenceAgent,
+        session_id="sess-public-queued-private",
+        pending_text="queued private follow-up",
+        pending_private=True,
+    )
+
+    assert QueuedSilenceAgent.calls == 2
+    assert result["_gateway_private_turn"] is True
+
+
+@pytest.mark.asyncio
+async def test_mixed_queued_chain_retains_private_chain_provenance(
+    monkeypatch, tmp_path,
+):
+    """A private middle turn keeps the full drain chain closed to persistence."""
+    MixedPrivacyQueueAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MixedPrivacyQueueAgent,
+        session_id="sess-public-private-public",
+        pending_private_sequence=[True, False],
+    )
+
+    assert MixedPrivacyQueueAgent.calls == 3
+    assert result["final_response"] == "public final response"
+    assert result["_gateway_private_turn"] is False
+    assert result["_gateway_chain_has_private_turn"] is True
+    assert "PRIVATE MIDDLE RESPONSE" not in [call["content"] for call in adapter.sent]
+
+
+def test_gateway_turn_provenance_rejects_raw_agent_spoofing():
+    from gateway.run import _stamp_gateway_turn_result
+
+    stamped = _stamp_gateway_turn_result(
+        {
+            "final_response": "private raw result",
+            "_gateway_private_turn": False,
+            "_gateway_chain_has_private_turn": False,
+        },
+        private_turn=True,
+    )
+
+    assert stamped["_gateway_private_turn"] is True
+    assert stamped["_gateway_chain_has_private_turn"] is True
+
+
+def test_gateway_turn_provenance_preserves_trusted_child_and_parent_chain():
+    from gateway.run import _stamp_gateway_turn_result
+
+    public_child = _stamp_gateway_turn_result(
+        {"final_response": "public child"}, private_turn=False
+    )
+    private_parent = _stamp_gateway_turn_result(public_child, private_turn=True)
+
+    assert private_parent["_gateway_private_turn"] is False
+    assert private_parent["_gateway_chain_has_private_turn"] is True
 
 
 @pytest.mark.asyncio

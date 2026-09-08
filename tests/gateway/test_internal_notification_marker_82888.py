@@ -93,12 +93,13 @@ def _source():
     )
 
 
-def _event(*, internal: bool, text: str = "hello world"):
+def _event(*, internal: bool, text: str = "hello world", private: bool = False):
     return MessageEvent(
         text=text,
         source=_source(),
         message_id=None if internal else "msg-82888",
         internal=internal,
+        metadata={"hermes_private_turn": True} if private else {},
     )
 
 
@@ -156,6 +157,61 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_private_parent_delivers_final_ordinary_queued_turn(monkeypatch, tmp_path):
+    """A public follow-up result must not inherit its private parent's filter."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "visible queued reply",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "completed": True,
+            "_gateway_private_turn": False,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(internal=True, text="private wake", private=True),
+        _source(), SESSION_KEY, 1,
+    )
+
+    assert response == "visible queued reply"
+
+
+@pytest.mark.asyncio
+async def test_public_parent_does_not_persist_final_private_queued_turn(
+    monkeypatch, tmp_path
+):
+    """Private child content stays out of the canonical gateway transcript."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "private queued response",
+            "messages": [
+                {"role": "user", "content": "private queued input"},
+                {"role": "assistant", "content": "private queued response"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "completed": True,
+            "agent_persisted": False,
+            "_gateway_private_turn": True,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(internal=False, text="public parent"),
+        _source(), SESSION_KEY, 1,
+    )
+
+    assert response == ""
+    assert runner.session_store.append_to_transcript.call_args_list == []  # type: ignore[attr-defined]
 
 
 # ── 3: gateway-side fallback rows carry the marker for internal events ─────

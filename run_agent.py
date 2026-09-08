@@ -2271,6 +2271,11 @@ class AIAgent:
             self._drop_trailing_empty_response_scaffolding(messages)
             if getattr(self, "_gateway_private_turn", False):
                 start_index = getattr(self, "_persist_user_message_idx", -1)
+                # Stamp the tail before discarding it from the cache.  The
+                # marker is message-local and therefore survives a later
+                # mutation of the cached agent's turn-wide privacy flag (for
+                # example during shutdown/restart recovery).
+                _mark_private_turn_messages(messages, start_index=start_index)
                 self._session_messages = messages[:start_index] if start_index >= 0 else []
             else:
                 self._session_messages = messages
@@ -2354,6 +2359,12 @@ class AIAgent:
         conversation_history: Optional[List[Dict]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
+        if getattr(self, "_gateway_private_turn", False):
+            _mark_private_turn_messages(
+                messages,
+                start_index=getattr(self, "_persist_user_message_idx", -1),
+            )
+            return None
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
@@ -2486,6 +2497,12 @@ class AIAgent:
                 # context. Skip regardless of position: an answered nudge leaves
                 # the synthetic pair buried mid-list, not just at the tail.
                 if _is_ephemeral_scaffolding(msg):
+                    continue
+                # Private messages remain excluded even if a cached agent has
+                # already been rebound to a later public turn.  This is the
+                # crash/restart-safe boundary; the mutable agent-level flag is
+                # only the fast path above.
+                if msg.get("hermes_private_turn"):
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue

@@ -11479,6 +11479,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 
+        # A real user message must never be steered into a private synthetic
+        # turn. The resulting answer would inherit the private boundary and be
+        # suppressed, losing the user's follow-up after the model acted on it.
+        # Queue it as the next ordinary turn instead, preserving both privacy
+        # and delivery provenance.
+        if (
+            running_agent is not None
+            and running_agent is not _AGENT_PENDING_SENTINEL
+            and getattr(running_agent, "_gateway_private_turn", False) is True
+        ):
+            logger.info(
+                "Demoting busy input to queue for session %s because the active turn is private",
+                session_key,
+            )
+            effective_mode = "queue"
+
         busy_text_mode = self._effective_busy_text_mode(event.source)
         if (
             event.message_type == MessageType.TEXT

@@ -242,3 +242,28 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         parent.steer.assert_called_once_with("course-correct")
         parent.interrupt.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_public_message_during_private_turn_is_queued_not_steered(
+        self,
+    ) -> None:
+        """User input must become a public follow-up, not private-turn content."""
+        runner = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._queue_or_replace_pending_event = MagicMock()
+        adapter = _make_adapter()
+        event = _make_event(text="through")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        parent._gateway_private_turn = True
+        parent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        parent.steer.assert_not_called()
+        parent.interrupt.assert_not_called()
+        runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+

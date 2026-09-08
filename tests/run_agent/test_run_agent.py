@@ -3317,6 +3317,33 @@ class TestRunConversation:
         assert len(transform_calls) == 1
         assert transform_calls[0]["response_text"] == "PRIVATE raw assistant output"
 
+    def test_private_turn_marker_is_never_sent_to_provider(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="ordinary response",
+            finish_reason="stop",
+        )
+        marked_history = [
+            {
+                "role": "assistant",
+                "content": "private completion placeholder",
+                "hermes_private_turn": True,
+            }
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "ordinary follow-up",
+                conversation_history=marked_history,
+            )
+
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("hermes_private_turn" not in message for message in sent_messages)
+
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 

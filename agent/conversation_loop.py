@@ -2535,6 +2535,9 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+            # Private-turn provenance is local persistence/recall metadata, not
+            # part of any provider message schema.
+            api_msg.pop("hermes_private_turn", None)
 
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).

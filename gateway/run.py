@@ -81,7 +81,7 @@ def _is_private_turn_event(event: Any, source: Any = None) -> bool:
             source if source is not None else getattr(event, "source", None),
             "_hermes_private_turn",
             False,
-        )
+        ) is True
     )
 
 
@@ -10035,6 +10035,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
             return
+        stamp_pending_order = getattr(adapter, "_stamp_pending_event_order", None)
+        if callable(stamp_pending_order):
+            stamp_pending_order(queued_event)
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
@@ -10044,6 +10047,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         else:
             pending_slot[session_key] = queued_event
+
+    def _restage_pending_event_for_adapter(
+        self, session_key: str, event: "MessageEvent", adapter: Any
+    ) -> None:
+        """Put a dequeued event back at its original adapter boundary.
+
+        Private turns must finish at the adapter boundary so lifecycle and
+        typing remain per-turn. This is the inverse of the adapter dequeue:
+        private wakes return to their FIFO head; ordinary input returns to the
+        public slot ahead of anything that arrived after it.
+        """
+        if _is_private_turn_event(event):
+            pending_private = getattr(adapter, "_pending_private_messages", None)
+            if not isinstance(pending_private, dict):
+                return
+            existing_private = pending_private.get(session_key)
+            if isinstance(existing_private, list):
+                existing_private.insert(0, event)
+            elif existing_private is None:
+                pending_private[session_key] = [event]
+            else:
+                pending_private[session_key] = [event, existing_private]
+            return
+
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return
+        existing = pending_slot.get(session_key)
+        pending_slot[session_key] = event
+        if existing is not None:
+            self._session_state(session_key).conversation.queued_events.insert(0, existing)
 
     def _promote_queued_event(
         self,
@@ -10065,6 +10099,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _q_state = self._peek_session_state(session_key)
         overflow = _q_state.conversation.queued_events if _q_state else None
         if not overflow:
+            return pending_event
+        # A private wake may have won the shared adapter dequeue by arrival
+        # time while a later ordinary user event still occupies the public
+        # slot. Never promote over that slot: doing so drops the user event
+        # before the private boundary can hand control back to the adapter.
+        if (
+            pending_event is not None
+            and _is_private_turn_event(pending_event)
+            and getattr(adapter, "_pending_messages", {}).get(session_key) is not None
+        ):
             return pending_event
         next_queued = overflow.pop(0)
         if pending_event is None:
@@ -11480,17 +11524,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _busy_state.turn.agent if _busy_state else None
 
         # A real user message must never be steered into a private synthetic
-        # turn. The resulting answer would inherit the private boundary and be
+        # turn, including one already queued behind the current public turn.
+        # The resulting answer would inherit the private boundary and be
         # suppressed, losing the user's follow-up after the model acted on it.
         # Queue it as the next ordinary turn instead, preserving both privacy
         # and delivery provenance.
-        if (
+        pending_private = getattr(adapter, "_pending_private_messages", None)
+        private_boundary_pending = bool(
+            isinstance(pending_private, dict) and pending_private.get(session_key)
+        )
+        private_boundary_active = (
             running_agent is not None
             and running_agent is not _AGENT_PENDING_SENTINEL
             and getattr(running_agent, "_gateway_private_turn", False) is True
-        ):
+        )
+        private_boundary = private_boundary_pending or private_boundary_active
+        if private_boundary:
             logger.info(
-                "Demoting busy input to queue for session %s because the active turn is private",
+                "Demoting busy input to queue for session %s because a private turn is pending or active",
                 session_key,
             )
             effective_mode = "queue"
@@ -11500,6 +11551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
             and effective_mode != "steer"
+            and not private_boundary
         ):
             return False
 
@@ -11711,7 +11763,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
+        if private_boundary:
+            # Do not reveal private turn activity, timing, or why the message
+            # was demoted. This remains a stable English acknowledgment across
+            # adapters so user input has a clear public outcome.
+            message = "⏳ Queued for the next turn."
+        elif is_steer_mode:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
@@ -21204,6 +21261,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         plugin_id: str,
         private: bool = False,
         on_dispatch_result: Optional[Callable[[bool], None]] = None,
+        on_turn_state: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
@@ -21244,6 +21302,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if private:
                     dispatch_kwargs["private"] = True
+                if on_turn_state is not None:
+                    dispatch_kwargs["on_turn_state"] = on_turn_state
                 result = bool(
                     await self._dispatch_plugin_message_injection(**dispatch_kwargs)
                 )
@@ -21330,6 +21390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         content: str,
         plugin_id: str,
         private: bool = False,
+        on_turn_state: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
@@ -21408,6 +21469,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 **({"hermes_private_turn": True} if private else {}),
             },
         )
+        # A process-local callback, never prompt content or persisted metadata.
+        if on_turn_state is not None:
+            setattr(event, "_injected_turn_state_callback", on_turn_state)
         try:
             accepted = await adapter.handle_message(event)
         except Exception:
@@ -21488,6 +21552,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     expected_session_key,
                     derived_session_key,
                 )
+                if private_turn:
+                    BasePlatformAdapter._report_injected_turn_state(event, "cancelled")
                 return
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
@@ -21507,6 +21573,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pinned_session_id or "missing",
                     expected_session_key or "missing",
                 )
+                if private_turn:
+                    BasePlatformAdapter._report_injected_turn_state(event, "cancelled")
                 return
         else:
             # Internal wakes must observe reset policy without becoming user
@@ -32881,6 +32949,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
+                if pending_event is not None and (
+                    private_turn or _is_private_turn_event(pending_event)
+                ):
+                    # Private wakes must cross the adapter execution boundary
+                    # rather than recurse inside this runner. That boundary
+                    # owns typing plus the process-local started/terminal
+                    # lifecycle callback. Re-stage this dequeued head without
+                    # touching a later ordinary slot or its FIFO overflow.
+                    self._restage_pending_event_for_adapter(
+                        session_key, pending_event, adapter
+                    )
+                    return response if isinstance(response, dict) else result
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot

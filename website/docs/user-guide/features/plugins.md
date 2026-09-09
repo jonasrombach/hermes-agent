@@ -722,7 +722,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, private: bool = False, on_dispatch_result: Callable[[bool], None] | None = None, on_turn_state: Callable[[str], None] | None = None) -> bool`
 
 In CLI mode:
 
@@ -740,6 +740,8 @@ In gateway mode:
 - Injected text is always conversational input. It cannot invoke slash commands, approve tools, or resolve pending confirmation and clarification prompts.
 - The route and conversation are pinned while dispatch is pending. Hermes drops the request if topic recovery changes the route or the session rotates before handling starts.
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
+- Use `private=True` for a silent internal turn: its output, progress, and failure details are not delivered to the platform. Private wakes queue FIFO without steering or interrupting an active turn; ordinary user input remains a separate queued turn in arrival order.
+- `on_turn_state` is a process-local callback for `"started"`, `"finished"`, or `"cancelled"`. It is never serialized or added to prompt/session content. Each accepted private wake receives exactly one terminal state, including wakes discarded by reset, shutdown, or a failed turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
 - Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
 

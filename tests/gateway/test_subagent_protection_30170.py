@@ -267,3 +267,31 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "Queued for the next turn" in content
 
+    @pytest.mark.asyncio
+    async def test_public_message_while_private_turn_is_pending_is_queued_not_steered(
+        self,
+    ) -> None:
+        """A queued private wake is already a private boundary for user input."""
+        runner = _make_runner()
+        runner._busy_input_mode = "steer"
+        runner._queue_or_replace_pending_event = MagicMock()
+        adapter = _make_adapter()
+        event = _make_event(text="wait for me")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        parent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = parent
+        adapter._pending_private_messages = {sk: [MessageEvent(
+            text="private wake", source=event.source, internal=True,
+            metadata={"hermes_private_turn": True},
+        )]}
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        parent.steer.assert_not_called()
+        parent.interrupt.assert_not_called()
+        runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+

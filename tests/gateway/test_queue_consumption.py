@@ -8,6 +8,7 @@ after the agent finishes its current task — not silently dropped.
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -169,6 +170,31 @@ class TestQueueConsumptionAfterCompletion:
         # gets the next-in-line item.
         assert adapter._pending_messages[session_key].text == "Q2"
 
+    def test_promote_private_wake_never_evicts_later_ordinary_queue(self):
+        """A private dequeue must not overwrite the still-pending user FIFO."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._queued_events = {}
+        adapter = _StubAdapter()
+        session_key = "telegram:user:private-wake"
+        first_user = MessageEvent(text="first user", source=MagicMock())
+        second_user = MessageEvent(text="second user", source=MagicMock())
+        private = MessageEvent(
+            text="private wake",
+            source=MagicMock(),
+            internal=True,
+            metadata={"hermes_private_turn": True},
+        )
+        adapter._pending_messages[session_key] = first_user
+        runner._queued_events[session_key] = [second_user]
+
+        returned = runner._promote_queued_event(session_key, adapter, private)
+
+        assert returned is private
+        assert adapter._pending_messages[session_key] is first_user
+        assert runner._queued_events[session_key] == [second_user]
+
 
 class TestBusyInputModeQueueFifo:
     """Regression coverage for issue #28503.
@@ -218,5 +244,53 @@ class TestBusyInputModeQueueFifo:
             "five",
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
+
+
+class TestPrivateWakeBusyQueue:
+    @pytest.mark.asyncio
+    async def test_busy_handler_keeps_later_user_behind_private_wake(self):
+        """Exercise the runner busy handler and adapter dequeue together."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running_agents = {}
+        runner._running_agents_ts = {}
+        runner._pending_messages = {}
+        runner._busy_ack_ts = {}
+        runner._draining = False
+        runner._busy_input_mode = "steer"
+        runner.adapters = {}
+        runner.config = MagicMock()
+        runner.session_store = None
+        runner.hooks = MagicMock()
+        runner.hooks.emit = MagicMock()
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = True
+        runner._is_user_authorized = lambda _source: True
+        adapter = _StubAdapter()
+        source = MagicMock(
+            chat_id="private-wake", platform=Platform.TELEGRAM, profile=None,
+            user_id="user", user_name="user", chat_type="dm", thread_id=None,
+        )
+        session_key = "telegram:user:private-wake"
+        private = MessageEvent(
+            text="private wake", source=source, internal=True,
+            metadata={"hermes_private_turn": True},
+        )
+        later_user = MessageEvent(
+            text="later user", message_type=MessageType.TEXT, source=source,
+        )
+        running_agent = MagicMock()
+        running_agent.steer = MagicMock(return_value=True)
+        runner._running_agents[session_key] = running_agent
+        runner.adapters[Platform.TELEGRAM] = adapter
+        adapter._pending_private_messages[session_key] = [private]
+
+        assert await runner._handle_active_session_busy_message(later_user, session_key) is True
+
+        running_agent.steer.assert_not_called()
+        assert adapter._pending_messages[session_key] is later_user
+        assert _dequeue_pending_event(adapter, session_key) is private
+        assert adapter._pending_messages[session_key] is later_user
 
 

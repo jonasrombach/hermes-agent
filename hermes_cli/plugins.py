@@ -2062,6 +2062,7 @@ class PluginContext:
         session_key: str | None = None,
         private: bool = False,
         on_dispatch_result: Callable[[bool], None] | None = None,
+        on_turn_state: Callable[[str], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -2145,6 +2146,8 @@ class PluginContext:
                 injection_kwargs["private"] = True
             if on_dispatch_result is not None:
                 injection_kwargs["on_dispatch_result"] = _report_result
+            if on_turn_state is not None:
+                injection_kwargs["on_turn_state"] = on_turn_state
             accepted = bool(self._manager.inject_gateway_message(**injection_kwargs))
             if not accepted:
                 # The injector may disappear after the availability check.

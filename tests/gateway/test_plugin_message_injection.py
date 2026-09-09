@@ -3,7 +3,7 @@
 import asyncio
 import concurrent.futures
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -670,7 +670,7 @@ async def test_private_plugin_event_waits_for_turn_boundary_without_busy_handler
 
     busy_handler.assert_not_awaited()
     adapter._message_handler.assert_not_awaited()
-    assert adapter._pending_private_messages[session_key] is event
+    assert adapter._pending_private_messages[session_key] == [event]
     assert session_key not in adapter._pending_messages
 
 
@@ -696,7 +696,7 @@ async def test_ordinary_pending_event_drains_before_private_plugin_event():
 
 
 @pytest.mark.asyncio
-async def test_second_private_plugin_event_is_rejected_without_merging_or_busy_ack():
+async def test_accepted_private_plugin_wakes_preserve_order_without_merging_or_busy_ack():
     adapter = _RoutingAdapter()
     adapter.set_message_handler(AsyncMock())
     entry = _entry()
@@ -724,11 +724,14 @@ async def test_second_private_plugin_event_is_rejected_without_merging_or_busy_a
         on_dispatch_result=second_receipt,
     ) is True
     second_task = next(task for task in runner._background_tasks if task is not first_task)
-    assert await second_task is False
+    assert await second_task is True
 
-    assert adapter._pending_private_messages[entry.session_key].text == "first private wake"
+    assert [event.text for event in adapter._pending_private_messages[entry.session_key]] == [
+        "first private wake",
+        "second private wake",
+    ]
     first_receipt.assert_called_once_with(True)
-    second_receipt.assert_called_once_with(False)
+    second_receipt.assert_called_once_with(True)
 
 
 @pytest.mark.asyncio
@@ -776,6 +779,53 @@ async def test_waiting_private_event_dispatches_with_private_and_strict_metadata
     assert seen[1].metadata["hermes_private_turn"] is True
     assert seen[1].metadata["gateway_session_strict"] is True
     assert seen[1].metadata["gateway_session_id"] == "session-42"
+
+
+@pytest.mark.asyncio
+async def test_private_wake_runs_before_later_ordinary_follow_up():
+    """The mixed pending queue follows arrival order after the active turn."""
+    adapter = _RoutingAdapter()
+    adapter.config.typing_indicator = False
+    source = _entry().origin
+    session_key = build_session_key(source)
+    current_started = asyncio.Event()
+    release_current = asyncio.Event()
+    seen = []
+
+    async def handler(event):
+        seen.append(event.text)
+        if event.text == "current turn":
+            current_started.set()
+            await release_current.wait()
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(MessageEvent(text="current turn", source=source))
+    await asyncio.wait_for(current_started.wait(), timeout=1)
+    private = MessageEvent(
+        text="private wake",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_private_turn": True, "gateway_session_key": session_key},
+    )
+    # Telegram ingress uses aware UTC timestamps while plugin injection uses
+    # MessageEvent's naive default. Arrival order must not fall back to public
+    # priority just because those provider timestamps cannot compare directly.
+    later_user = MessageEvent(
+        text="later ordinary follow-up",
+        source=source,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    assert await adapter.handle_message(private) is True
+    await adapter.handle_message(later_user)
+    release_current.set()
+    for _ in range(100):
+        if seen == ["current turn", "private wake", "later ordinary follow-up"]:
+            break
+        await asyncio.sleep(0.01)
+
+    assert seen == ["current turn", "private wake", "later ordinary follow-up"]
 
 
 @pytest.mark.asyncio

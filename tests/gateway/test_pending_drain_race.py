@@ -202,6 +202,77 @@ async def test_finally_cleanup_drains_late_arrival_pending():
 
 
 @pytest.mark.asyncio
+async def test_final_drain_requeues_private_head_without_overwriting_later_user():
+    """The final drain must keep a private head in its FIFO after in-band handoff."""
+    adapter = _make_adapter()
+    adapter.config.typing_indicator = False
+    sk = _sk()
+    source = _make_event().source
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    private_one_started = asyncio.Event()
+    release_private_one = asyncio.Event()
+    seen = []
+
+    async def handler(event):
+        seen.append(event)
+        if event.text == "active public":
+            active_started.set()
+            await release_active.wait()
+        elif event.text == "private one":
+            private_one_started.set()
+            await release_private_one.wait()
+
+    adapter._message_handler = handler
+    active_public = MessageEvent(text="active public", source=source)
+    private_one = MessageEvent(
+        text="private one",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_private_turn": True, "gateway_session_key": sk},
+    )
+    private_two = MessageEvent(
+        text="private two",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_private_turn": True, "gateway_session_key": sk},
+    )
+    later_user = MessageEvent(text="later user", source=source)
+
+    try:
+        await adapter.handle_message(active_public)
+        active_task = adapter._session_tasks[sk]
+        await asyncio.wait_for(active_started.wait(), timeout=5.0)
+
+        assert await adapter.handle_message(private_one) is True
+        assert await adapter.handle_message(private_two) is True
+        await adapter.handle_message(later_user)
+
+        release_active.set()
+        # The active task dequeues private_one in-band and transfers session
+        # ownership to its successor. Its finally drain then dequeues
+        # private_two while later_user still owns the ordinary slot.
+        await asyncio.wait_for(asyncio.shield(active_task), timeout=5.0)
+        await asyncio.wait_for(private_one_started.wait(), timeout=5.0)
+
+        assert adapter._pending_messages[sk] is later_user
+        assert adapter._pending_private_messages[sk] == [private_two]
+
+        release_private_one.set()
+        for _ in range(100):
+            if seen == [active_public, private_one, private_two, later_user]:
+                break
+            await asyncio.sleep(0.01)
+        assert seen == [active_public, private_one, private_two, later_user]
+    finally:
+        release_active.set()
+        release_private_one.set()
+        await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_no_pending_cleans_up_normally():
     """Regression guard: when no pending message exists, the finally
     block must still delete _active_sessions as before (no leak)."""

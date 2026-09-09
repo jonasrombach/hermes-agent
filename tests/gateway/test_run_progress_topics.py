@@ -1402,12 +1402,12 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
 
 
 @pytest.mark.asyncio
-async def test_private_turn_queued_user_followup_returns_public_turn_provenance(
+async def test_private_turn_defers_queued_user_followup_to_adapter_boundary(
     monkeypatch, tmp_path,
 ):
-    """The final result belongs to the ordinary queued turn, not its private parent."""
+    """A private turn ends before its public follow-up is executed."""
     QueuedSilenceAgent.calls = 0
-    _adapter, result = await _run_with_agent(
+    adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         QueuedSilenceAgent,
@@ -1416,18 +1416,19 @@ async def test_private_turn_queued_user_followup_returns_public_turn_provenance(
         private_turn=True,
     )
 
-    assert QueuedSilenceAgent.calls == 2
-    assert result["final_response"] == "follow-up processed"
-    assert result["_gateway_private_turn"] is False
+    assert QueuedSilenceAgent.calls == 1
+    assert result["final_response"] == "NO_REPLY"
+    assert result["_gateway_private_turn"] is True
+    assert [event.text for event in adapter._pending_messages.values()] == ["queued user follow-up"]
 
 
 @pytest.mark.asyncio
-async def test_public_turn_queued_private_followup_returns_private_turn_provenance(
+async def test_public_turn_defers_queued_private_followup_to_adapter_boundary(
     monkeypatch, tmp_path,
 ):
-    """A queued private turn must not inherit its public parent's delivery state."""
+    """A queued private wake starts only from the adapter boundary."""
     QueuedSilenceAgent.calls = 0
-    _adapter, result = await _run_with_agent(
+    adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         QueuedSilenceAgent,
@@ -1436,15 +1437,19 @@ async def test_public_turn_queued_private_followup_returns_private_turn_provenan
         pending_private=True,
     )
 
-    assert QueuedSilenceAgent.calls == 2
-    assert result["_gateway_private_turn"] is True
+    assert QueuedSilenceAgent.calls == 1
+    assert result["final_response"] == "NO_REPLY"
+    assert result["_gateway_private_turn"] is False
+    assert [event.text for queue in adapter._pending_private_messages.values() for event in queue] == [
+        "queued private follow-up"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_mixed_queued_chain_retains_private_chain_provenance(
+async def test_mixed_queued_chain_defers_private_boundary(
     monkeypatch, tmp_path,
 ):
-    """A private middle turn keeps the full drain chain closed to persistence."""
+    """The first private wake returns to the adapter before the chain continues."""
     MixedPrivacyQueueAgent.calls = 0
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1454,10 +1459,13 @@ async def test_mixed_queued_chain_retains_private_chain_provenance(
         pending_private_sequence=[True, False],
     )
 
-    assert MixedPrivacyQueueAgent.calls == 3
-    assert result["final_response"] == "public final response"
+    assert MixedPrivacyQueueAgent.calls == 1
+    assert result["final_response"] == "NO_REPLY"
     assert result["_gateway_private_turn"] is False
-    assert result["_gateway_chain_has_private_turn"] is True
+    assert result["_gateway_chain_has_private_turn"] is False
+    assert [event.text for queue in adapter._pending_private_messages.values() for event in queue] == [
+        "queued turn 1"
+    ]
     assert "PRIVATE MIDDLE RESPONSE" not in [call["content"] for call in adapter.sent]
 
 

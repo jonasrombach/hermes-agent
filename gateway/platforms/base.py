@@ -3283,10 +3283,14 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
-        # One private plugin turn may wait behind an active session.  Keep it
-        # separate from ordinary pending input so an ordinary follow-up always
-        # remains the next turn.
-        self._pending_private_messages: Dict[str, MessageEvent] = {}
+        # Process-local ingress sequence for mixed public/private pending
+        # heads. Provider timestamps are not comparable across synthetic and
+        # platform events (e.g. naive plugin time vs aware Telegram time).
+        self._pending_event_sequence = 0
+        # Private plugin wakes wait behind an active session in their own FIFO.
+        # The public and private heads are selected by ingress order at each
+        # turn boundary; accepted wakes themselves never merge or replace.
+        self._pending_private_messages: Dict[str, List[MessageEvent]] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
@@ -6199,7 +6203,7 @@ class BasePlatformAdapter(ABC):
         )
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
-        getattr(self, "_pending_private_messages", {}).pop(session_key, None)
+        self._discard_pending_private_messages(session_key)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -6283,8 +6287,12 @@ class BasePlatformAdapter(ABC):
                 )
         if discard_pending:
             self._pending_messages.pop(session_key, None)
-            getattr(self, "_pending_private_messages", {}).pop(session_key, None)
+            self._discard_pending_private_messages(session_key)
             self._discard_text_debounce(session_key)
+        else:
+            # Reset-like commands keep ordinary user follow-ups for the fresh
+            # session, but never carry a private wake across that boundary.
+            self._discard_pending_private_messages(session_key)
         if release_guard:
             self._release_session_guard(session_key)
 
@@ -6435,6 +6443,7 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            self._stamp_pending_event_order(event)
             # Private plugin turns must never enter the active turn's busy
             # handler: that path can steer or interrupt ordinary user input.
             # One separate slot preserves their boundary while leaving the
@@ -6448,9 +6457,14 @@ class BasePlatformAdapter(ABC):
                 if pending_private is None:
                     pending_private = {}
                     self._pending_private_messages = pending_private
-                if session_key in pending_private:
-                    return False
-                pending_private[session_key] = event
+                queued_private = pending_private.get(session_key)
+                if queued_private is None:
+                    queued_private = pending_private[session_key] = []
+                elif not isinstance(queued_private, list):
+                    # Tolerate older in-memory state and test fixtures that
+                    # populated the former single-event slot directly.
+                    queued_private = pending_private[session_key] = [queued_private]
+                queued_private.append(event)
                 return True
 
             # Certain commands must bypass the active-session guard and be
@@ -6645,6 +6659,38 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    @staticmethod
+    def _report_injected_turn_state(event: MessageEvent, state: str) -> None:
+        callback = getattr(event, "_injected_turn_state_callback", None)
+        if not callable(callback):
+            return
+        if state in {"finished", "cancelled"}:
+            delattr(event, "_injected_turn_state_callback")
+        try:
+            callback(state)
+        except Exception:
+            logger.warning("Injected turn lifecycle callback failed", exc_info=True)
+
+    def _stamp_pending_event_order(self, event: MessageEvent) -> None:
+        """Attach a non-serialized ingress sequence once an event is pending."""
+        if isinstance(getattr(event, "_hermes_pending_order", None), int):
+            return
+        self._pending_event_sequence = getattr(self, "_pending_event_sequence", 0) + 1
+        setattr(event, "_hermes_pending_order", self._pending_event_sequence)
+
+    def _discard_pending_private_messages(self, session_key: str) -> None:
+        """Cancel every queued private wake for a discarded session boundary."""
+        pending_private = getattr(self, "_pending_private_messages", None)
+        if not isinstance(pending_private, dict):
+            return
+        queued = pending_private.pop(session_key, None)
+        if queued is None:
+            return
+        events = queued if isinstance(queued, list) else [queued]
+        for event in events:
+            if isinstance(event, MessageEvent):
+                self._report_injected_turn_state(event, "cancelled")
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -6696,7 +6742,10 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
 
-            # Call the handler (this can take a while with tool calls)
+            # Call the handler (this can take a while with tool calls).
+            # This is the execution boundary: queued wakes do not report
+            # started or show typing until they reach this task.
+            self._report_injected_turn_state(event, "started")
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
@@ -7211,6 +7260,7 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            self._report_injected_turn_state(event, "finished")
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -7259,6 +7309,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            self._report_injected_turn_state(event, "cancelled")
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -7266,27 +7317,35 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            self._report_injected_turn_state(event, "cancelled")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # Private turns are intentionally invisible: their exception text
+            # can contain wake payload or tool output and must never reach the
+            # platform. Public failures keep the historical user-facing error.
+            private_turn = bool(
+                (event.metadata or {}).get("hermes_private_turn")
+                or getattr(event.source, "_hermes_private_turn", False)
+            )
+            if not private_turn:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
             # Preserve shutdown semantics: SystemExit/KeyboardInterrupt must
             # still propagate after the user-facing failure notification, so
             # the loop's own signal handling can shut down cleanly. Other
@@ -7368,7 +7427,20 @@ class BasePlatformAdapter(ABC):
                     # (#17758 follow-up: prevents the create_task path
                     # from racing with itself across the in-band/finally
                     # boundary).
-                    self._pending_messages[session_key] = late_pending
+                    if bool(
+                        (late_pending.metadata or {}).get("hermes_private_turn")
+                        or getattr(late_pending.source, "_hermes_private_turn", False)
+                    ):
+                        pending_private = self._pending_private_messages
+                        queued_private = pending_private.get(session_key)
+                        if isinstance(queued_private, list):
+                            queued_private.insert(0, late_pending)
+                        elif queued_private is None:
+                            pending_private[session_key] = [late_pending]
+                        else:
+                            pending_private[session_key] = [late_pending, queued_private]
+                    else:
+                        self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(
                         "[%s] Late-arrival pending message during cleanup — spawning drain task",
@@ -7488,7 +7560,8 @@ class BasePlatformAdapter(ABC):
         except Exception:
             pass
         self._pending_messages.clear()
-        getattr(self, "_pending_private_messages", {}).clear()
+        for session_key in list(getattr(self, "_pending_private_messages", {})):
+            self._discard_pending_private_messages(session_key)
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
@@ -7500,15 +7573,56 @@ class BasePlatformAdapter(ABC):
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
-        """Get and clear the next pending turn for a session.
+        """Get and clear the next pending turn in arrival order.
 
-        Ordinary input owns the existing pending slot and therefore wins over
-        one private plugin turn waiting at the same boundary.
+        The ordinary slot and private FIFO remain separate for privacy, but
+        their heads share one turn boundary. Compare their ingress timestamps
+        so a user message already waiting still runs first while a later user
+        follow-up cannot leapfrog an accepted private wake.
         """
-        pending = self._pending_messages.pop(session_key, None)
-        if pending is not None:
+        pending = self._pending_messages.get(session_key)
+        pending_private = getattr(self, "_pending_private_messages", {})
+        queued_private = pending_private.get(session_key)
+        private_head = queued_private[0] if isinstance(queued_private, list) and queued_private else queued_private
+        if pending is not None and private_head is not None:
+            pending_order = getattr(pending, "_hermes_pending_order", None)
+            private_order = getattr(private_head, "_hermes_pending_order", None)
+            if (
+                isinstance(pending_order, int)
+                and isinstance(private_order, int)
+                and pending_order != private_order
+            ):
+                if private_order < pending_order:
+                    if isinstance(queued_private, list):
+                        pending = queued_private.pop(0)
+                        if not queued_private:
+                            pending_private.pop(session_key, None)
+                        return pending
+                    return pending_private.pop(session_key, None)
+                else:
+                    return self._pending_messages.pop(session_key, None)
+            pending_at = getattr(pending, "timestamp", None)
+            private_at = getattr(private_head, "timestamp", None)
+            try:
+                if private_at is not None and pending_at is not None and private_at < pending_at:
+                    pending = None
+                else:
+                    return self._pending_messages.pop(session_key, None)
+            except TypeError:
+                # Preserve the established ordinary-first fallback for exotic
+                # test/custom events without comparable timestamps.
+                return self._pending_messages.pop(session_key, None)
+        elif pending is not None:
+            return self._pending_messages.pop(session_key, None)
+        if isinstance(queued_private, list):
+            if not queued_private:
+                pending_private.pop(session_key, None)
+                return None
+            pending = queued_private.pop(0)
+            if not queued_private:
+                pending_private.pop(session_key, None)
             return pending
-        return getattr(self, "_pending_private_messages", {}).pop(session_key, None)
+        return pending_private.pop(session_key, None)
     
     def build_source(
         self,

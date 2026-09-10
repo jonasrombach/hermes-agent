@@ -231,6 +231,7 @@ async def test_private_plugin_event_reaches_gateway_setup_before_early_persisten
 
     early_persistence = []
     constructed = []
+    cached_gateway_session_keys = []
 
     class ProbeAgent:
         def __init__(self, **kwargs):
@@ -257,6 +258,9 @@ async def test_private_plugin_event_reaches_gateway_setup_before_early_persisten
             )
 
         def run_conversation(self, message, conversation_history=None, **_kwargs):
+            cached_gateway_session_keys.append(
+                getattr(self, "_gateway_session_key", None)
+            )
             messages = list(conversation_history or []) + [
                 {"role": "user", "content": message}
             ]
@@ -313,6 +317,10 @@ async def test_private_plugin_event_reaches_gateway_setup_before_early_persisten
     TurnRunner(gateway_runner, ctx).run_sync()
 
     assert constructed == ["session-42"]
+    assert cached_gateway_session_keys == [
+        "agent:main:telegram:dm:42",
+        "agent:main:telegram:dm:42",
+    ]
     assert early_persistence == [
         (True, [{"role": "assistant", "content": "ordinary history"}]),
         (True, [{"role": "assistant", "content": "ordinary history"}]),

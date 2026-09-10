@@ -6462,6 +6462,9 @@ class TurnRunner:
         # tool_progress/thinking off — the None gate was exactly why a dead
         # subagent vanished silently there.
         agent._gateway_private_turn = ctx.private_turn
+        # Cached agents are constructed only once, but completion transforms
+        # need the current stable gateway identity on every turn.
+        agent._gateway_session_key = ctx.session_key
         agent.tool_progress_callback = ctx.progress_callback
         # Compose ID-bearing lifecycle consumers: Discord's one-time voice
         # ack and Slack's native task cards both ride the authoritative

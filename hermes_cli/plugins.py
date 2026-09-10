@@ -2061,13 +2061,20 @@ class PluginContext:
         *,
         session_key: str | None = None,
         private: bool = False,
+        busy_policy: str | None = None,
         on_dispatch_result: Callable[[bool], None] | None = None,
         on_turn_state: Callable[[str], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
         If the agent is idle (waiting for user input), this starts a new turn.
-        If the agent is running, this interrupts and injects the message.
+        Default busy handling remains surface-specific: CLI injection interrupts,
+        while ordinary internal gateway injections queue. For gateway calls,
+        ``busy_policy="steer"`` is an explicit non-private opt-in:
+        it uses the active agent's existing steer rail at its next safe boundary,
+        never interrupts or queues behind the turn. If no active steer can be
+        accepted, gateway dispatch is rejected so the plugin can retain and retry
+        its source event.
 
         This enables plugins (e.g. remote control viewers, messaging bridges)
         to send messages into the conversation from external sources.
@@ -2084,6 +2091,9 @@ class PluginContext:
         Returns True if the message was queued successfully.
         """
         result_reported = False
+        if busy_policy not in (None, "steer") or (private and busy_policy is not None):
+            logger.warning("inject_message: unsupported busy policy %r", busy_policy)
+            return False
 
         def _report_result(result: bool) -> None:
             nonlocal result_reported
@@ -2144,6 +2154,8 @@ class PluginContext:
             }
             if private:
                 injection_kwargs["private"] = True
+            if busy_policy is not None:
+                injection_kwargs["busy_policy"] = busy_policy
             if on_dispatch_result is not None:
                 injection_kwargs["on_dispatch_result"] = _report_result
             if on_turn_state is not None:

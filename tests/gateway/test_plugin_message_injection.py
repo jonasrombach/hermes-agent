@@ -205,6 +205,59 @@ async def test_private_dispatch_marks_event_without_mutating_stored_origin():
 
 
 @pytest.mark.asyncio
+async def test_plugin_context_busy_steer_reaches_live_private_agent_without_queueing(
+    tmp_path, monkeypatch,
+):
+    """Plugin forwarding, gateway dispatch, and the real adapter busy rail agree."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"entries": {"ambient-wake": {"allow_gateway_injection": True}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = _entry()
+    adapter = _RoutingAdapter()
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    active_gate = asyncio.Event()
+    active_task = asyncio.create_task(active_gate.wait())
+    adapter._session_tasks[entry.session_key] = active_task
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._busy_input_mode = "interrupt"
+    agent = MagicMock()
+    agent.steer.return_value = True
+    agent._gateway_private_turn = True
+    runner._running_agents = {entry.session_key: agent}
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    manager = PluginManager()
+    context = PluginContext(
+        PluginManifest(name="ambient-wake", key="ambient-wake", source="user"), manager,
+    )
+    receipt = MagicMock()
+
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        runner._install_plugin_message_injector()
+        assert context.inject_message(
+            "External OwnTracks data (not a message from Jonas)",
+            session_key=entry.session_key,
+            busy_policy="steer",
+            on_dispatch_result=receipt,
+        ) is True
+        task = next(iter(runner._background_tasks))
+        assert await task is True
+
+    agent.steer.assert_called_once_with("External OwnTracks data (not a message from Jonas)")
+    agent.interrupt.assert_not_called()
+    assert entry.session_key not in adapter._pending_messages
+    receipt.assert_called_once_with(True)
+    active_gate.set()
+    await active_task
+
+
+@pytest.mark.asyncio
 async def test_private_plugin_event_reaches_gateway_setup_before_early_persistence(
     monkeypatch,
 ):

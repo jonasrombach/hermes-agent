@@ -223,6 +223,44 @@ def test_gateway_injection_forwards_private_receipt_callback(tmp_path, monkeypat
     receipt.assert_called_once_with(True)
 
 
+def test_gateway_injection_forwards_explicit_busy_steer_policy(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "External OwnTracks data",
+        session_key="agent:main:telegram:dm:42",
+        busy_policy="steer",
+    ) is True
+
+    assert injector.call_args.kwargs["busy_policy"] == "steer"
+
+
+def test_gateway_injection_rejects_busy_steer_for_a_private_turn(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "private wake",
+        session_key="agent:main:telegram:dm:42",
+        private=True,
+        busy_policy="steer",
+    ) is False
+    injector.assert_not_called()
+
+
 def test_gateway_injection_returns_host_rejection(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,

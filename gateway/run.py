@@ -11396,7 +11396,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
-        effective_mode = self._effective_busy_input_mode(event.source)
+        event_metadata = getattr(event, "metadata", None) or {}
+        plugin_busy_steer = bool(
+            getattr(event, "internal", False)
+            and event_metadata.get("hermes_plugin_injection") is True
+            and event_metadata.get("hermes_plugin_busy_policy") == "steer"
+        )
+        effective_mode = "steer" if plugin_busy_steer else self._effective_busy_input_mode(event.source)
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -11517,10 +11523,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # never splices into a running turn. Plugin events carry untrusted
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
-        if getattr(event, "internal", False) and not event.allow_gateway_control:
+        if (
+            getattr(event, "internal", False)
+            and not event.allow_gateway_control
+            and not plugin_busy_steer
+        ):
             self._queue_or_replace_pending_event(session_key, event)
             return True
-        if getattr(event, "internal", False):
+        if getattr(event, "internal", False) and not plugin_busy_steer:
             return False
 
         _busy_state = self._peek_session_state(session_key)
@@ -11542,7 +11552,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and getattr(running_agent, "_gateway_private_turn", False) is True
         )
         private_boundary = private_boundary_pending or private_boundary_active
-        if private_boundary:
+        if private_boundary and not plugin_busy_steer:
             logger.info(
                 "Demoting busy input to queue for session %s because a private turn is pending or active",
                 session_key,
@@ -11625,6 +11635,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
             if not steered:
+                if plugin_busy_steer:
+                    # Do not queue a direct event behind this task. Rejection
+                    # keeps its source item pending for the plugin to retry.
+                    setattr(event, "_hermes_plugin_steer_rejected", True)
+                    return True
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
         elif (
@@ -11642,6 +11657,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
+
+        if plugin_busy_steer and steered:
+            # An opted-in plugin handoff is neither user input nor a queued
+            # follow-up, so do not replay it or emit a busy acknowledgement.
+            return True
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -21263,6 +21283,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         content: str,
         plugin_id: str,
         private: bool = False,
+        busy_policy: Optional[str] = None,
         on_dispatch_result: Optional[Callable[[bool], None]] = None,
         on_turn_state: Optional[Callable[[str], None]] = None,
     ) -> bool:
@@ -21305,6 +21326,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if private:
                     dispatch_kwargs["private"] = True
+                if busy_policy is not None:
+                    dispatch_kwargs["busy_policy"] = busy_policy
                 if on_turn_state is not None:
                     dispatch_kwargs["on_turn_state"] = on_turn_state
                 result = bool(
@@ -21393,10 +21416,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         content: str,
         plugin_id: str,
         private: bool = False,
+        busy_policy: Optional[str] = None,
         on_turn_state: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+        if busy_policy not in (None, "steer") or (private and busy_policy is not None):
             return False
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
@@ -21470,6 +21496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
                 **({"hermes_private_turn": True} if private else {}),
+                **({"hermes_plugin_busy_policy": "steer"} if busy_policy == "steer" else {}),
             },
         )
         # A process-local callback, never prompt content or persisted metadata.
@@ -21491,6 +21518,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_id,
                 session_key,
             )
+            return False
+        if getattr(event, "_hermes_plugin_steer_rejected", False):
             return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",

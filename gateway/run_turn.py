@@ -1676,6 +1676,8 @@ class GatewayTurnMixin:
         store = self.async_session_store
         sid = session_entry.session_id
         history = prepared.history
+        if bool((event.metadata or {}).get("hermes_private_turn") or getattr(source, "_hermes_private_turn", False)):
+            return
         # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
         # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
         # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip

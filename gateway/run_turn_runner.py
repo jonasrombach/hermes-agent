@@ -755,6 +755,8 @@ class TurnRunner:
     # ── hook / status bridges (agent thread → gateway loop) ────────────────────────────────
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
+        if self._ctx.private_turn:
+            return
         ctx = self._ctx
         if not ctx._run_still_current():
             return

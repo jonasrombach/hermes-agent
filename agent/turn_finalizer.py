@@ -406,6 +406,8 @@ def _apply_output_hooks(
     Returns ``(final_response, transformed, pre_transform_response)``."""
     transformed, pre_transform = False, None
     private_turn = getattr(agent, "_gateway_private_turn", False) is True
+    if private_turn:
+        return "NO_REPLY", transformed, pre_transform
     # First hook to return a string wins; None/empty leaves the text unchanged.
     for _hook_result in _invoke_hook_safely(
         "transform_llm_output", logger,
@@ -430,8 +432,6 @@ def _apply_output_hooks(
             model=agent.model,
             platform=platform,
         )
-    if private_turn and not transformed:
-        final_response = "NO_REPLY"
     return final_response, transformed, pre_transform
 
 
@@ -625,6 +625,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not getattr(agent, "_gateway_private_turn", False)
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
@@ -636,7 +637,7 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    if not getattr(agent, "_persist_disabled", False):
+    if not getattr(agent, "_gateway_private_turn", False) and not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
             "on_session_end", logger,
             session_id=agent.session_id,

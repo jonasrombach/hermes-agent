@@ -759,7 +759,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
 
     # Persistence-disabled forks share their parent's session ID and are not real sessions.
-    if not getattr(agent, "_persist_disabled", False):
+    if not getattr(agent, "_persist_disabled", False) and getattr(agent, "_gateway_private_turn", False) is not True:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -1179,6 +1179,8 @@ def _apply_context_engine_selection(
 ) -> List[Dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
+    if getattr(agent, "_gateway_private_turn", False) is True:
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
         return api_messages

@@ -58,6 +58,8 @@ def _fire_post_api_request_hook(
 ) -> None:
     from agent.conversation_loop import _moa_reference_metrics_for_hook
 
+    if getattr(agent, "_gateway_private_turn", False) is True:
+        return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook as _invoke_hook
         if has_hook("post_api_request"):
@@ -147,7 +149,7 @@ def normalize_model_response(
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content}")
         else:
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content[:100]}{'...' if len(content) > 100 else ''}")
-    if content and agent.tool_progress_callback:
+    if content and agent.tool_progress_callback and getattr(agent, "_gateway_private_turn", False) is not True:
         _relay_thinking(agent, content)
 
     # Incomplete <REASONING_SCRATCHPAD> (opened, never closed): the model ran out of

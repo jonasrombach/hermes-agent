@@ -3322,7 +3322,7 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
-    def test_private_turn_skips_api_observers_but_keeps_model_and_transform(self, agent):
+    def test_private_turn_skips_api_and_output_observers(self, agent):
         self._setup_agent(agent)
         agent._gateway_private_turn = True
         agent.client.chat.completions.create.return_value = _mock_response(
@@ -3354,8 +3354,7 @@ class TestRunConversation:
             if name in {"pre_api_request", "post_api_request"}
         ]
         transform_calls = [kwargs for name, kwargs in hook_calls if name == "transform_llm_output"]
-        assert len(transform_calls) == 1
-        assert transform_calls[0]["response_text"] == "PRIVATE raw assistant output"
+        assert transform_calls == []
 
     def test_private_turn_marker_is_never_sent_to_provider(self, agent):
         self._setup_agent(agent)

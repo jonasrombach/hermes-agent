@@ -120,4 +120,19 @@ def test_private_output_is_replaced_before_gateway_delivery(monkeypatch) -> None
 
     assert response == "NO_REPLY"
     assert transformed is False
-    assert [name for name, _ in observed] == ["transform_llm_output"]
+    assert observed == []
+
+
+def test_ordinary_plugin_steer_is_an_explicit_opt_in() -> None:
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    context = PluginContext(
+        PluginManifest(name="ordinary-plugin", key="ordinary-plugin", source="user"), manager,
+    )
+    context._gateway_injection_allowed = lambda: True
+
+    assert context.inject_message("wake", session_key="session-key", busy_policy="steer") is True
+    assert injector.call_args.kwargs["busy_policy"] == "steer"

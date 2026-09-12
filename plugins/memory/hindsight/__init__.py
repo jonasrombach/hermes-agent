@@ -976,6 +976,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_result, self._prefetch_count = "", 0
         return self._finish_prefetch(result, count)
 
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Discard a previous asynchronous recall before a trivial turn."""
+        if is_trivial_prompt(message):
+            with self._prefetch_lock:
+                self._prefetch_result, self._prefetch_count = "", 0
+
     def recall_status(self) -> Optional[RecallStatus]:
         """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
         if not self._recall_indicator or not self._last_recall_returned:

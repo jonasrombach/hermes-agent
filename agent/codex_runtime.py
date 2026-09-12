@@ -352,6 +352,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
+        if getattr(agent, "_gateway_private_turn", False) is True:
+            return
         handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
         if handler is not None:
             params = note.get("params")
@@ -416,7 +418,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
     only the new codex rows are written. The agent stays the sole persister (agent_persisted=True): a
     gateway re-write would re-INSERT the user turn."""
-    if not turn.projected_messages:
+    if getattr(agent, "_gateway_private_turn", False) is True or not turn.projected_messages:
         return
     from agent.message_metadata import append_message
     projected_messages = turn.projected_messages
@@ -455,12 +457,13 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     if should_review_skills:
         agent._iters_since_skill = 0
     # External memory sync skipped on interrupt/error (no partial transcripts).
-    if not turn.interrupted and turn.error is None:
+    if getattr(agent, "_gateway_private_turn", False) is not True and not turn.interrupted and turn.error is None:
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
             original_user_message=original_user_message, final_response=turn.final_text, interrupted=False, messages=messages,
         ))
     # Background review fork: only when a trigger tripped AND a real final response exists.
-    if turn.final_text and not turn.interrupted and (should_review_memory or should_review_skills):
+    if (getattr(agent, "_gateway_private_turn", False) is not True and turn.final_text and not turn.interrupted
+            and (should_review_memory or should_review_skills)):
         _call_guarded(getattr(agent, "_spawn_background_review", None), "background review spawn raised", kwargs=dict(
             messages_snapshot=list(messages), review_memory=should_review_memory, review_skills=should_review_skills,
         ))
@@ -499,7 +502,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
-        final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        final_response="NO_REPLY" if getattr(agent, "_gateway_private_turn", False) is True else turn.final_text,
+        agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
     )
 

@@ -39,12 +39,11 @@ sys.modules.setdefault("telegram", _tg)
 sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
-from gateway.platforms.base import (  # noqa: E402
-    MessageEvent,
-    MessageType,
+from gateway.platforms.base import (
     SessionSource,
     build_session_key,
 )
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner  # noqa: E402
 
 
@@ -124,34 +123,6 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
-    adapter._send_with_retry.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_explicit_plugin_busy_steer_reaches_a_private_active_turn_without_interrupting() -> None:
-    """Only an opted-in plugin event may steer rather than queue behind a private turn."""
-    runner = _make_runner()
-    runner._busy_input_mode = "interrupt"
-    adapter = _make_adapter()
-    event = _make_internal_event("External OwnTracks data (not a message from Jonas)")
-    event.allow_gateway_control = False
-    event.metadata = {
-        "hermes_plugin_injection": True,
-        "hermes_plugin_busy_policy": "steer",
-    }
-    sk = build_session_key(event.source)
-    parent = _make_running_parent()
-    parent.steer.return_value = True
-    parent._gateway_private_turn = True
-    runner._running_agents[sk] = parent
-    runner.adapters[event.source.platform] = adapter
-
-    handled = await runner._handle_active_session_busy_message(event, sk)
-
-    assert handled is True
-    parent.steer.assert_called_once_with(event.text)
-    parent.interrupt.assert_not_called()
-    assert adapter._pending_messages == {}
     adapter._send_with_retry.assert_not_called()
 
 

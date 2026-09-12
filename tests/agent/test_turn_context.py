@@ -92,7 +92,6 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
-        self._gateway_private_turn = False
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
@@ -215,25 +214,6 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
-def test_private_turn_skips_pre_llm_observer_but_normal_turn_calls_it(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "hermes_cli.lifecycle.invoke_hook",
-        lambda name, **kwargs: calls.append((name, kwargs)) or [],
-    )
-    agent = _FakeAgent()
-    agent._gateway_private_turn = True
-
-    _build(agent, user_message="PRIVATE injected envelope")
-
-    assert calls == []
-
-    agent._gateway_private_turn = False
-    _build(agent, user_message="ordinary question")
-
-    assert [name for name, _kwargs in calls] == ["pre_llm_call"]
-
-
 def test_preflight_timeout_stops_turn_before_provider_boundary():
     """An unchanged oversized payload must not escape turn construction."""
     agent = _FakeAgent()
@@ -272,42 +252,6 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
     provider_call.assert_not_called()
 
 
-def test_private_turn_does_not_compact_or_archive_current_transcript():
-    """Turn-start compaction must not receive private raw transcript material."""
-    agent = _FakeAgent()
-    agent._gateway_private_turn = True
-    agent.compression_enabled = True
-    agent.max_compression_attempts = 1
-    agent.context_compressor = types.SimpleNamespace(
-        protect_first_n=0,
-        protect_last_n=0,
-        threshold_tokens=100,
-        context_length=400,
-        summary_target_ratio=0.3,
-        last_prompt_tokens=0,
-        should_compress=lambda tokens=None: True,
-        should_compress_info=lambda tokens=None: (True, None),
-        get_active_compression_failure_cooldown=lambda: None,
-    )
-    archived_transcripts = []
-
-    def archive_and_compact(messages, *_args, **_kwargs):
-        archived_transcripts.append([message.get("content") for message in messages])
-        return [messages[-1]], "SYSTEM"
-
-    agent._compress_context = MagicMock(side_effect=archive_and_compact)
-    history = [
-        {"role": "user", "content": "old " * 800},
-        {"role": "assistant", "content": "old response"},
-        {"role": "user", "content": "another old turn"},
-    ]
-
-    _build(agent, user_message="PRIVATE current turn", conversation_history=history)
-
-    agent._compress_context.assert_not_called()
-    assert archived_transcripts == []
-
-
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 
@@ -344,27 +288,61 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(f"Current user message:\n{query}")
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
-def test_prefetch_uses_recent_eligible_conversation_messages():
+# ── Per-turn author ──────────────────────────────────────────────────────────
+
+
+def test_turn_author_is_normalized_then_reaches_on_turn_start_and_the_agent_stash():
     agent, mm = _agent_with_memory_manager()
-    history = [
-        {"role": "user", "content": "An earlier short message."},
-        {"role": "assistant", "content": "An earlier final answer."},
-        {"role": "user", "content": "The recall planner is nearly 3,000 lines."},
-        {"role": "assistant", "content": "That would be over-engineered for us."},
-    ]
 
-    _build(agent, user_message="Ah shit", conversation_history=history)
+    _build(agent, user_message="what did we decide about the deploy pipeline?",
+           turn_author={"id": " bot:al\x00pha ", "name": "Alpha", "is_bot": 1, "x": 1})
 
-    sent_query = mm.prefetch_all.call_args.args[0]
-    assert sent_query.startswith("Current user message:\nAh shit")
-    assert "The recall planner is nearly 3,000 lines." in sent_query
-    assert "That would be over-engineered for us." in sent_query
-    assert "An earlier short message." in sent_query
-    assert "An earlier final answer." in sent_query
+    kwargs = mm.on_turn_start.call_args.kwargs
+    assert (kwargs["author_id"], kwargs["author_name"], kwargs["author_is_bot"]) == ("bot:alpha", "Alpha", True)
+    # The end-of-turn sync reads this back off the agent.
+    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+
+
+def test_turn_without_author_clears_previous_bot_author():
+    agent, mm = _agent_with_memory_manager()
+    _build(agent, user_message="first turn", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
+    assert agent._turn_author["id"] == "bot:alpha"
+
+    _build(agent, user_message="second turn")
+
+    assert agent._turn_author is None
+    kwargs = mm.on_turn_start.call_args.kwargs
+    assert kwargs["author_id"] is None
+    assert kwargs["author_is_bot"] is False
+
+
+def test_turn_author_reaches_the_agent_through_the_real_facade(monkeypatch):
+    """``AIAgent.run_conversation(turn_author=...)`` crosses the facade and the loop entry point, not only
+    ``build_turn_context``; a kwarg dropped at either hop raised TypeError on every real turn."""
+    from types import SimpleNamespace
+    from run_agent import AIAgent
+
+    class _Completions:
+        def create(self, **_kw):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None, reasoning=None, reasoning_content=None),
+                finish_reason="stop")], usage=None, model="test-model")
+
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI",
+                        lambda **_kw: SimpleNamespace(chat=SimpleNamespace(completions=_Completions())))
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **k: [])
+    agent = AIAgent(model="test-model", api_key="k", base_url="http://localhost:1/v1", platform="cli",
+                    max_iterations=2, quiet_mode=True, skip_memory=True)
+    agent._disable_streaming = True
+
+    agent.run_conversation("hi", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
+    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+    agent.run_conversation("hi again")
+    assert agent._turn_author is None
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
@@ -416,14 +394,6 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
-
-
-
-
-
-
-
-
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
@@ -441,12 +411,6 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["_db_persisted"] is True
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert agent._pending_cli_user_message is None
-
-
-
-
-
-
 
 
 def test_recall_indicator_emitted_when_memory_injected():
@@ -521,7 +485,8 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
 
     import model_tools
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+    import tools.mcp_tool  # noqa: F401 — the prologue's import-cost gate requires it in sys.modules
+    with patch("tools.mcp_tool_discovery.has_registered_mcp_tools", return_value=True), \
          patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
 
@@ -569,17 +534,3 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
-
-
-def test_prologue_does_not_title_private_gateway_turn():
-    """Private raw text must not reach the title-generator side channel."""
-    from agent import turn_context
-
-    agent = _TitlingAgent("telegram")
-    agent._gateway_private_turn = True
-    with patch("agent.title_generator.maybe_auto_title") as titler:
-        turn_context._maybe_title_session_at_turn_start(
-            agent, [{"role": "user", "content": "PRIVATE injected envelope"}]
-        )
-
-    titler.assert_not_called()

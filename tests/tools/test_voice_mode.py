@@ -549,6 +549,10 @@ class TestWhisperHallucinationFilter:
         assert is_whisper_hallucination("Bye.") is True
         assert is_whisper_hallucination("  Thank you.  ") is True  # with whitespace
         assert is_whisper_hallucination("you") is True
+        assert is_whisper_hallucination("Vielen Dank.") is True
+        assert is_whisper_hallucination("Danke schön.") is True
+        assert is_whisper_hallucination("Tschüss.") is True
+        assert is_whisper_hallucination("ARD Text im Auftrag des WDR") is True
 
     def test_real_speech_not_filtered(self):
         from tools.voice_mode import is_whisper_hallucination

@@ -1802,7 +1802,6 @@ class GatewayInboundMixin:
             return False
 
         source = dataclasses.replace(entry.origin)
-        if private: source._hermes_private_turn = True
         try:
             authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
         except Exception:

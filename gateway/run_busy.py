@@ -658,7 +658,7 @@ class GatewayBusySessionMixin:
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         metadata = event.metadata or {}
-        private_event = bool(metadata.get("hermes_private_turn") or getattr(event.source, "_hermes_private_turn", False))
+        private_event = bool(metadata.get("hermes_private_turn"))
         plugin_busy_steer = bool(not private_event and metadata.get("hermes_plugin_injection") is True and metadata.get("hermes_plugin_busy_policy") == "steer")
         if private_event:
             return False  # BasePlatformAdapter owns the isolated private FIFO.
@@ -688,15 +688,7 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
-        adapter = self._adapter_for_source(event.source)
         effective_mode = "steer" if plugin_busy_steer else self._effective_busy_input_mode(event.source)
-        active = self._peek_session_state(session_key)
-        active_agent = getattr(getattr(active, "turn", None), "agent", None) or getattr(self, "_running_agents", {}).get(session_key)
-        private_active = bool(getattr(active_agent, "_gateway_private_turn", False))
-        private_pending = bool(adapter and getattr(adapter, "_pending_private_messages", {}).get(session_key))
-        if (private_active or private_pending) and not plugin_busy_steer:
-            self._queue_or_replace_pending_event(session_key, event)
-            return True
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
             return True

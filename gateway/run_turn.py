@@ -1676,7 +1676,7 @@ class GatewayTurnMixin:
         store = self.async_session_store
         sid = session_entry.session_id
         history = prepared.history
-        if bool((event.metadata or {}).get("hermes_private_turn") or getattr(source, "_hermes_private_turn", False)):
+        if bool((event.metadata or {}).get("hermes_private_turn")):
             return
         # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
         # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
@@ -2027,7 +2027,7 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
                 message_type=event.message_type,
-                private_turn=bool((event.metadata or {}).get("hermes_private_turn") or getattr(source, "_hermes_private_turn", False)),
+                private_turn=bool((event.metadata or {}).get("hermes_private_turn")),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 

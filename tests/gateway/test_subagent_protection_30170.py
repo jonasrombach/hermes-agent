@@ -243,3 +243,4 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert injected.endswith("course-correct")
         assert '"chat_id": "123"' in injected
         parent.interrupt.assert_not_called()
+

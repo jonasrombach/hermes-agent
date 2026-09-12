@@ -3554,8 +3554,7 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
-        private_turn = bool((event.metadata or {}).get("hermes_private_turn")
-                            or getattr(event.source, "_hermes_private_turn", False))
+        private_turn = bool((event.metadata or {}).get("hermes_private_turn"))
         if private_turn:
             self._stamp_pending_order(event)
             self._pending_private_messages.setdefault(session_key, []).append(event)
@@ -4001,8 +4000,7 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        private_turn = bool((event.metadata or {}).get("hermes_private_turn")
-                            or getattr(event.source, "_hermes_private_turn", False))
+        private_turn = bool((event.metadata or {}).get("hermes_private_turn"))
         typing_task = None if private_turn else self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -4079,8 +4077,7 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            if not bool((event.metadata or {}).get("hermes_private_turn")
-                        or getattr(event.source, "_hermes_private_turn", False)):
+            if not bool((event.metadata or {}).get("hermes_private_turn")):
                 _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):

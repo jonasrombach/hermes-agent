@@ -1758,6 +1758,7 @@ class GatewayInboundMixin:
         busy_policy: str | None = None,
         on_dispatch_result: Callable[[bool], None] | None = None,
         on_turn_state: Callable[[str], None] | None = None,
+        response_transform: Callable[[Any, str], str | None] | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1774,6 +1775,8 @@ class GatewayInboundMixin:
             dispatch_kwargs["busy_policy"] = busy_policy
         if on_turn_state is not None:
             dispatch_kwargs["on_turn_state"] = on_turn_state
+        if response_transform is not None:
+            dispatch_kwargs["response_transform"] = response_transform
         coro = self._dispatch_plugin_message_injection(**dispatch_kwargs)
         try:
             current_loop = asyncio.get_running_loop()
@@ -1824,6 +1827,7 @@ class GatewayInboundMixin:
         self, *, session_key: str, content: str, plugin_id: str, private: bool = False,
         busy_policy: str | None = None,
         on_turn_state: Callable[[str], None] | None = None,
+        response_transform: Callable[[Any, str], str | None] | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1865,6 +1869,8 @@ class GatewayInboundMixin:
             })
         if on_turn_state is not None:
             setattr(event, "_injected_turn_state_callback", on_turn_state)
+        if response_transform is not None:
+            setattr(event, "_injected_response_transform", response_transform)
         try:
             await adapter.handle_message(event)
         except Exception:

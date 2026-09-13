@@ -615,6 +615,7 @@ class PluginContext:
         busy_policy: str | None = None,
         on_dispatch_result: Callable[[bool], None] | None = None,
         on_turn_state: Callable[[str], None] | None = None,
+        response_transform: Callable[[Any, str], str | None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
         Gateway injection needs an existing ``session_key`` plus
@@ -654,12 +655,16 @@ class PluginContext:
         if busy_policy not in (None, "steer") or (private and busy_policy is not None):
             logger.warning("inject_message: unsupported busy policy %r", busy_policy)
             return False
+        if response_transform is not None and (not private or not callable(response_transform)):
+            logger.warning("inject_message: response_transform requires a private callable")
+            return False
         try:
             kwargs: Dict[str, Any] = {"session_key": session_key, "content": msg, "plugin_id": self.plugin_id}
             if private: kwargs["private"] = True
             if busy_policy: kwargs["busy_policy"] = busy_policy
             if on_dispatch_result is not None: kwargs["on_dispatch_result"] = _report_result
             if on_turn_state is not None: kwargs["on_turn_state"] = on_turn_state
+            if response_transform is not None: kwargs["response_transform"] = response_transform
             accepted = bool(self._manager.inject_gateway_message(**kwargs))
             if not accepted:
                 _report_result(False)

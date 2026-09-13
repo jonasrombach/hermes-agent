@@ -407,7 +407,10 @@ def _apply_output_hooks(
     transformed, pre_transform = False, None
     private_turn = getattr(agent, "_gateway_private_turn", False) is True
     if private_turn:
-        return "NO_REPLY", transformed, pre_transform
+        # The gateway adapter owns the fail-closed release boundary for a
+        # private injected turn. Keep raw output process-local and skip every
+        # global hook; only the injection's direct callback may release text.
+        return final_response, transformed, pre_transform
     # First hook to return a string wins; None/empty leaves the text unchanged.
     for _hook_result in _invoke_hook_safely(
         "transform_llm_output", logger,

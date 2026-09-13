@@ -736,6 +736,11 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        # A plugin steer delivered into an isolated private turn is internal
+        # coordination, not a user follow-up; never leak a busy-ack bubble.
+        if plugin_busy_steer and bool(getattr(running_agent, "_gateway_private_turn", False)):
+            return True
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":

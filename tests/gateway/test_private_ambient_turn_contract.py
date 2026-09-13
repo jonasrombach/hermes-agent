@@ -118,9 +118,55 @@ def test_private_output_is_replaced_before_gateway_delivery(monkeypatch) -> None
         messages=[],
     )
 
-    assert response == "NO_REPLY"
+    assert response == "private model output"
     assert transformed is False
     assert observed == []
+
+
+def test_private_response_requires_its_process_local_release_callback() -> None:
+    event = MessageEvent(
+        text="private wake",
+        source=_source(),
+        internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+
+    assert BasePlatformAdapter._release_private_response(
+        event, "raw private output", "session-key"
+    ) is None
+
+
+def test_private_response_uses_only_its_process_local_release_callback() -> None:
+    event = MessageEvent(
+        text="private wake",
+        source=_source(),
+        internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    observed = []
+    event._injected_response_transform = lambda response_text, session_key: (
+        observed.append((response_text, session_key)) or "released notification"
+    )
+
+    assert BasePlatformAdapter._release_private_response(
+        event, "raw private output", "session-key"
+    ) == "released notification"
+    assert BasePlatformAdapter._release_private_response(
+        event, "second raw output", "session-key"
+    ) is None
+    assert observed == [("raw private output", "session-key")]
+
+
+def test_injected_turn_lifecycle_callback_is_terminal_once() -> None:
+    event = MessageEvent(text="private wake", source=_source(), internal=True)
+    observed = []
+    event._injected_turn_state_callback = observed.append
+
+    BasePlatformAdapter._report_injected_turn_state(event, "started")
+    BasePlatformAdapter._report_injected_turn_state(event, "finished")
+    BasePlatformAdapter._report_injected_turn_state(event, "cancelled")
+
+    assert observed == ["started", "finished"]
 
 
 def test_ordinary_plugin_steer_is_an_explicit_opt_in() -> None:

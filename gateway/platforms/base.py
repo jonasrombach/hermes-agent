@@ -3987,6 +3987,35 @@ class BasePlatformAdapter(ABC):
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
+    @staticmethod
+    def _release_private_response(
+        event: MessageEvent, response: Any, session_key: str,
+    ) -> Optional[str]:
+        """Run only this injection's process-local private release callback."""
+        callback = getattr(event, "_injected_response_transform", None)
+        if not callable(callback):
+            return None
+        delattr(event, "_injected_response_transform")
+        try:
+            released = callback(response, session_key)
+        except Exception:
+            logger.warning("Injected private response transform failed", exc_info=True)
+            return None
+        return released if isinstance(released, str) and released else None
+
+    @staticmethod
+    def _report_injected_turn_state(event: MessageEvent, state: str) -> None:
+        """Report injected-turn lifecycle exactly once at terminal state."""
+        callback = getattr(event, "_injected_turn_state_callback", None)
+        if not callable(callback):
+            return
+        if state in {"finished", "cancelled"}:
+            delattr(event, "_injected_turn_state_callback")
+        try:
+            callback(state)
+        except Exception:
+            logger.warning("Injected turn lifecycle callback failed", exc_info=True)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
@@ -4004,11 +4033,13 @@ class BasePlatformAdapter(ABC):
         typing_task = None if private_turn else self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
+            self._report_injected_turn_state(event, "started")
             response = await self._message_handler(event)
-            # Private plugin turns execute for side effects only. Their raw
-            # response must never reach a platform, TTS, or attachment path.
+            # Private plugin turns fail closed. Their raw response may leave
+            # this process only through the callback attached to this exact
+            # injection; global plugin hooks never see it.
             if private_turn:
-                response = None
+                response = self._release_private_response(event, response, session_key)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4058,6 +4089,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
+            self._report_injected_turn_state(event, "finished")
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
@@ -4069,12 +4101,14 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            self._report_injected_turn_state(event, "cancelled")
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            self._report_injected_turn_state(event, "cancelled")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             if not bool((event.metadata or {}).get("hermes_private_turn")):

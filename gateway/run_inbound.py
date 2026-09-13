@@ -1716,6 +1716,28 @@ class GatewayInboundMixin:
             self, self._schedule_plugin_message_injection
         )
 
+    def _fire_gateway_ready_plugin_hooks(self) -> None:
+        """Notify plugins once the injection-capable gateway runtime is ready."""
+        if getattr(self, "_gateway_ready_plugin_hooks_fired", False):
+            return
+
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        if not manager.has_gateway_message_injector:
+            return
+
+        # Set before dispatch because a callback can re-enter the gateway.
+        self._gateway_ready_plugin_hooks_fired = True
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+
+            invoke_hook("gateway_ready", gateway=self, adapters=self.adapters)
+        except Exception:
+            logger.warning("gateway_ready plugin hook dispatch failed", exc_info=True)
+            return
+
+
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""
         from hermes_cli.plugins import get_plugin_manager

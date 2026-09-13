@@ -1396,6 +1396,7 @@ class GatewayStartupMixin:
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()
+        self._fire_gateway_ready_plugin_hooks()
         self._update_runtime_status("running")
         await self._start_finish_wiring(connected_count)
         self._start_spawn_background_watchers()

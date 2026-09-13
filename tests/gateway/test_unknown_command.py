@@ -92,6 +92,38 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
+async def test_plugin_command_receives_invoking_stable_session_key(monkeypatch):
+    """A gateway plugin command receives the invoking conversation identity."""
+    from hermes_cli import plugins as plugins_mod
+
+    runner = _make_runner()
+    runner.__dict__["_last_active_session_key"] = "telegram:dm:historical-conversation"
+    observed = []
+
+    def handler(raw_args, command_context):
+        observed.append((raw_args, command_context))
+        return "bound"
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "bind" else None,
+    )
+    source = _make_source()
+    source.chat_id = "invoking-chat"
+    event = MessageEvent(text="/bind now", source=source, message_id="m1")
+
+    result = await runner._handle_message(event)
+
+    assert result == "bound"
+    assert len(observed) == 1
+    raw_args, command_context = observed[0]
+    assert raw_args == "now"
+    assert vars(command_context) == {"session_key": build_session_key(source)}
+    assert command_context.session_key != runner._last_active_session_key
+
+
+@pytest.mark.asyncio
 async def test_unknown_slash_command_returns_guidance(monkeypatch):
     """A genuinely unknown /foobar should return user-facing guidance, not
     silently drop through to the LLM."""

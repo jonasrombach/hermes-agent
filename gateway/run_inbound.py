@@ -992,10 +992,19 @@ class GatewayInboundMixin:
         # underscored autocomplete form matches plugin commands registered with hyphens.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    PluginCommandContext,
+                    get_plugin_command_handler,
+                    invoke_plugin_command,
+                )
+                from gateway.session import build_session_key
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
+                    result = invoke_plugin_command(
+                        plugin_handler,
+                        event.get_command_args().strip(),
+                        PluginCommandContext(session_key=build_session_key(source)),
+                    )
                     if asyncio.iscoroutine(result):
                         result = await result
                     return True, str(result) if result else None, command

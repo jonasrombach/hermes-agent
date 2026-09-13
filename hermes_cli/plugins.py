@@ -78,6 +78,13 @@ class PluginToolOverrideError(PermissionError):
     """Plugin tried to override a built-in tool without ``plugins.entries.<id>.allow_tool_override``."""
 
 
+@dataclass(frozen=True)
+class PluginCommandContext:
+    """Immutable gateway conversation identity for a plugin slash command."""
+
+    session_key: str
+
+
 logger = logging.getLogger(__name__)
 
 # ``HERMES_PLUGINS_DEBUG=1`` tees verbose discovery logs to stderr in addition to agent.log. Read
@@ -690,9 +697,8 @@ class PluginContext:
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
         argument_mode: str | None = None,
     ) -> Optional[PluginRegistration]:
-        """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
-        (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
-        field; without it the command registers parameterless there but still accepts trailing text."""
+        """Register an in-session slash command with one or two positional arguments."""
+        _plugin_command_accepts_context(handler)
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
@@ -2017,6 +2023,52 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def _plugin_command_accepts_context(handler: Callable) -> bool:
+    """Validate a slash-command handler and report whether it accepts context."""
+    if not callable(handler):
+        raise TypeError("Plugin command handler must be callable")
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "Plugin command handler must have one or two positional arguments"
+        ) from exc
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(positional) not in {1, 2}:
+        raise TypeError(
+            "Plugin command handler must have one or two positional arguments"
+        )
+    required_keyword_only = [
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+    ]
+    if required_keyword_only:
+        raise TypeError(
+            "Plugin command handler must not require keyword-only arguments"
+        )
+    return len(positional) == 2
+
+
+def invoke_plugin_command(
+    handler: Callable,
+    raw_args: str,
+    command_context: PluginCommandContext,
+) -> Any:
+    """Invoke a validated plugin command without retrying handler failures."""
+    if _plugin_command_accepts_context(handler):
+        return handler(raw_args, command_context)
+    return handler(raw_args)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

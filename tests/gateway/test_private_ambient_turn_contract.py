@@ -136,6 +136,20 @@ def test_private_response_requires_its_process_local_release_callback() -> None:
     ) is None
 
 
+def test_private_no_reply_release_is_suppressed() -> None:
+    event = MessageEvent(
+        text="private wake",
+        source=_source(),
+        internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    setattr(event, "_injected_response_transform", lambda _response, _session_key: "NO_REPLY")
+
+    assert BasePlatformAdapter._release_private_response(
+        event, "raw private output", "session-key"
+    ) is None
+
+
 def test_private_response_uses_only_its_process_local_release_callback() -> None:
     event = MessageEvent(
         text="private wake",

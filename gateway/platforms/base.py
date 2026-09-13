@@ -4001,6 +4001,8 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.warning("Injected private response transform failed", exc_info=True)
             return None
+        if released == "NO_REPLY":
+            return None
         return released if isinstance(released, str) and released else None
 
     @staticmethod

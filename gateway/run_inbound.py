@@ -25,7 +25,7 @@ from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -1747,6 +1747,8 @@ class GatewayInboundMixin:
     def _schedule_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, private: bool = False,
         busy_policy: str | None = None,
+        on_dispatch_result: Callable[[bool], None] | None = None,
+        on_turn_state: Callable[[str], None] | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1754,23 +1756,16 @@ class GatewayInboundMixin:
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
-        if private and busy_policy:
-            coro = self._dispatch_plugin_message_injection(
-                session_key=session_key, content=content, plugin_id=plugin_id,
-                private=True, busy_policy=busy_policy,
-            )
-        elif private:
-            coro = self._dispatch_plugin_message_injection(
-                session_key=session_key, content=content, plugin_id=plugin_id, private=True,
-            )
-        elif busy_policy:
-            coro = self._dispatch_plugin_message_injection(
-                session_key=session_key, content=content, plugin_id=plugin_id, busy_policy=busy_policy,
-            )
-        else:
-            coro = self._dispatch_plugin_message_injection(
-                session_key=session_key, content=content, plugin_id=plugin_id,
-            )
+        dispatch_kwargs: Dict[str, Any] = {
+            "session_key": session_key, "content": content, "plugin_id": plugin_id,
+        }
+        if private:
+            dispatch_kwargs["private"] = True
+        if busy_policy:
+            dispatch_kwargs["busy_policy"] = busy_policy
+        if on_turn_state is not None:
+            dispatch_kwargs["on_turn_state"] = on_turn_state
+        coro = self._dispatch_plugin_message_injection(**dispatch_kwargs)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1795,12 +1790,19 @@ class GatewayInboundMixin:
 
         def _log_result(completed) -> None:
             try:
-                if completed.result():
+                result = bool(completed.result())
+                if on_dispatch_result is not None:
+                    on_dispatch_result(result)
+                if result:
                     return
                 what, exc = "was not routed", None
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                if on_dispatch_result is not None:
+                    on_dispatch_result(False)
                 return
             except Exception as err:
+                if on_dispatch_result is not None:
+                    on_dispatch_result(False)
                 what, exc = "failed", err
             logger.warning(
                 "Plugin message injection %s: plugin=%s session=%s", what, plugin_id, session_key, exc_info=exc,
@@ -1812,6 +1814,7 @@ class GatewayInboundMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, private: bool = False,
         busy_policy: str | None = None,
+        on_turn_state: Callable[[str], None] | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1851,6 +1854,8 @@ class GatewayInboundMixin:
                 **({"hermes_private_turn": True} if private else {}),
                 **({"hermes_plugin_busy_policy": "steer"} if busy_policy == "steer" else {}),
             })
+        if on_turn_state is not None:
+            setattr(event, "_injected_turn_state_callback", on_turn_state)
         try:
             await adapter.handle_message(event)
         except Exception:

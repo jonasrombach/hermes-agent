@@ -164,6 +164,29 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
     )
 
 
+def test_gateway_injection_forwards_dispatch_receipt_callback(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    receipts = []
+
+    assert context.inject_message(
+        "region transition",
+        session_key="agent:main:telegram:dm:42",
+        busy_policy="steer",
+        on_dispatch_result=receipts.append,
+    ) is True
+
+    forwarded = injector.call_args.kwargs["on_dispatch_result"]
+    forwarded(True)
+    assert receipts == [True]
+
+
 def test_gateway_injection_returns_host_rejection(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,

@@ -356,6 +356,26 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
 
 
 @pytest.mark.asyncio
+async def test_scheduler_reports_actual_async_dispatch_result():
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    receipts = []
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="region transition",
+        plugin_id="hermes-wake",
+        busy_policy="steer",
+        on_dispatch_result=receipts.append,
+    ) is True
+    assert receipts == []
+
+    await asyncio.gather(*runner._background_tasks)
+    assert receipts == [True]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_ignores_same_loop_task_cancellation():
     runner = _runner(_entry())
     loop = asyncio.get_running_loop()

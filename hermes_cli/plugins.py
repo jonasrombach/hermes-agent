@@ -606,11 +606,27 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None, private: bool = False,
         busy_policy: str | None = None,
+        on_dispatch_result: Callable[[bool], None] | None = None,
+        on_turn_state: Callable[[str], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
         request for async dispatch, not that delivery completed."""
+        result_reported = False
+
+        def _report_result(result: bool) -> None:
+            nonlocal result_reported
+            if result_reported:
+                return
+            result_reported = True
+            if on_dispatch_result is None:
+                return
+            try:
+                on_dispatch_result(bool(result))
+            except Exception:
+                logger.warning("inject_message: dispatch result callback failed", exc_info=True)
+
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
@@ -632,13 +648,19 @@ class PluginContext:
             logger.warning("inject_message: unsupported busy policy %r", busy_policy)
             return False
         try:
-            kwargs = {"session_key": session_key, "content": msg, "plugin_id": self.plugin_id}
+            kwargs: Dict[str, Any] = {"session_key": session_key, "content": msg, "plugin_id": self.plugin_id}
             if private: kwargs["private"] = True
             if busy_policy: kwargs["busy_policy"] = busy_policy
-            return bool(self._manager.inject_gateway_message(**kwargs))
+            if on_dispatch_result is not None: kwargs["on_dispatch_result"] = _report_result
+            if on_turn_state is not None: kwargs["on_turn_state"] = on_turn_state
+            accepted = bool(self._manager.inject_gateway_message(**kwargs))
+            if not accepted:
+                _report_result(False)
+            return accepted
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)
+            _report_result(False)
             return False
 
     def _gateway_injection_allowed(self) -> bool:

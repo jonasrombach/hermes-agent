@@ -3356,11 +3356,18 @@ class GatewayTurnMixin:
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
     async def _run_agent_drain_pending(
-        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
+        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
+        *, private_turn: bool = False,
     ) -> Tuple[Any, Optional[str]]:
         """Dequeue the adapter's pending / interrupt / leftover-steer follow-up as ``(pending_event, pending)``.
 
         Keyed by session_key (not source.chat_id) to match the adapter's storage keys."""
+        # A private injected event owns its raw completion until BasePlatformAdapter runs the
+        # event-local response transform. Recursing into an external pending message here would
+        # leak that raw completion and replace the callback input with the later user's answer.
+        # Leave external input queued for the adapter's post-release handoff.
+        if private_turn:
+            return None, None
         from gateway.run import (
             _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
         )
@@ -3947,7 +3954,9 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._adapter_for_source(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = await self._run_agent_drain_pending(
+                result, adapter, source, session_key, private_turn=turn_ctx.private_turn,
+            )
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

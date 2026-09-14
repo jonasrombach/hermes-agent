@@ -143,6 +143,31 @@ async def _wait_until(predicate) -> None:
 
 
 @pytest.mark.asyncio
+async def test_private_turn_leaves_queued_user_follow_up_for_adapter_handoff() -> None:
+    """Private completion must reach its callback before a later user turn starts."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner(config=GatewayConfig())
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    user = MessageEvent(text="user follow-up", source=_source())
+    adapter._pending_messages[session_key] = user
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {"final_response": "[[rocky-wake]] raw private completion"},
+        adapter,
+        _source(),
+        session_key,
+        private_turn=True,
+    )
+
+    assert pending_event is None
+    assert pending is None
+    assert adapter._pending_messages[session_key] is user
+
+
+@pytest.mark.asyncio
 async def test_user_follow_up_waits_for_private_release_before_its_own_turn() -> None:
     """Exercise the live adapter -> GatewayRunner busy path in both turn directions."""
     from gateway.config import GatewayConfig

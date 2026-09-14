@@ -4032,7 +4032,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         private_turn = bool((event.metadata or {}).get("hermes_private_turn"))
-        typing_task = None if private_turn else self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
             self._report_injected_turn_state(event, "started")

@@ -1,11 +1,13 @@
 """Minimal contract for private ambient gateway turns."""
 
+import asyncio
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
@@ -22,6 +24,26 @@ class _PrivateQueueAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
         return SendResult(success=True)
+
+
+class _TypingLifecycleAdapter(_PrivateQueueAdapter):
+    """Production-shaped Telegram adapter with observable typing transport."""
+
+    def __init__(self) -> None:
+        super().__init__(PlatformConfig(enabled=True, token="test-token"), Platform.TELEGRAM)
+        self.sent: list[str] = []
+        self.typing_calls: list[str] = []
+        self.stop_calls: list[str] = []
+
+    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(content)
+        return SendResult(success=True, message_id=str(len(self.sent)))
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        self.typing_calls.append(chat_id)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        self.stop_calls.append(chat_id)
 
 
 def _source() -> SessionSource:
@@ -50,6 +72,201 @@ async def test_private_event_is_accepted_into_a_separate_pending_queue() -> None
 
     assert event._gateway_accepted is True
     assert adapter._pending_private_messages == {"session-key": [event]}
+
+
+@pytest.mark.asyncio
+async def test_queued_private_turn_types_only_when_running_then_stops_after_no_reply_release() -> None:
+    """A queued heartbeat owns a typing lifecycle only after its turn starts, even when it is silent."""
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    ordinary_started = asyncio.Event()
+    release_ordinary = asyncio.Event()
+    private_started = asyncio.Event()
+    release_private = asyncio.Event()
+    transformed = []
+
+    async def handler(event):
+        if (event.metadata or {}).get("hermes_private_turn"):
+            private_started.set()
+            await release_private.wait()
+            return "private raw completion"
+        ordinary_started.set()
+        await release_ordinary.wait()
+        return "ordinary response"
+
+    adapter._message_handler = handler
+    ordinary = MessageEvent(text="ordinary", source=_source())
+    private = MessageEvent(
+        text="private heartbeat", source=_source(), internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    setattr(
+        private,
+        "_injected_response_transform",
+        lambda response, key: transformed.append((response, key)) or "NO_REPLY",
+    )
+
+    await adapter.handle_message(ordinary)
+    await asyncio.wait_for(ordinary_started.wait(), timeout=1.0)
+    await asyncio.wait_for(
+        _wait_until(lambda: len(adapter.typing_calls) == 1), timeout=1.0,
+    )
+
+    await adapter.handle_message(private)
+    assert adapter._pending_private_messages[session_key] == [private]
+    await asyncio.sleep(0.05)
+    assert len(adapter.typing_calls) == 1  # Still only the unrelated ordinary turn.
+
+    release_ordinary.set()
+    await asyncio.wait_for(private_started.wait(), timeout=1.0)
+    await asyncio.wait_for(
+        _wait_until(lambda: len(adapter.typing_calls) == 2), timeout=1.0,
+    )
+
+    release_private.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+    calls_after_finish = len(adapter.typing_calls)
+    await asyncio.sleep(0.05)
+
+    assert transformed == [("private raw completion", session_key)]
+    assert adapter.sent == ["ordinary response"]
+    assert len(adapter.stop_calls) >= 2
+    assert len(adapter.typing_calls) == calls_after_finish
+    assert session_key not in adapter._active_sessions
+
+
+async def _wait_until(predicate) -> None:
+    while not predicate():
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_private_transform_failure_stops_typing_without_delivering_raw_output() -> None:
+    """A malformed/rejected private completion cannot leave a Telegram refresh owner behind."""
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_event):
+        started.set()
+        await release.wait()
+        return "raw private completion"
+
+    def reject(_response, _key):
+        raise ValueError("completion rejected")
+
+    event = MessageEvent(
+        text="private heartbeat", source=_source(), internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    setattr(event, "_injected_response_transform", reject)
+    adapter._message_handler = handler
+
+    await adapter.handle_message(event)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(_wait_until(lambda: adapter.typing_calls), timeout=1.0)
+    release.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+
+    assert adapter.sent == []
+    assert adapter.stop_calls
+    assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_private_notification_release_stops_typing_after_delivery() -> None:
+    """A released heartbeat notification ends its refresh owner after the visible send."""
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_event):
+        started.set()
+        await release.wait()
+        return "raw private completion"
+
+    event = MessageEvent(
+        text="private heartbeat", source=_source(), internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    setattr(event, "_injected_response_transform", lambda _response, _key: "heartbeat notification")
+    adapter._message_handler = handler
+
+    await adapter.handle_message(event)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(_wait_until(lambda: adapter.typing_calls), timeout=1.0)
+    release.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+
+    assert adapter.sent == ["heartbeat notification"]
+    assert adapter.stop_calls
+    assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_private_turn_stops_typing_and_releases_its_session_guard() -> None:
+    """Cancellation is terminal for the private turn's typing owner and session guard."""
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    started = asyncio.Event()
+
+    async def handler(_event):
+        started.set()
+        await asyncio.Event().wait()
+
+    event = MessageEvent(
+        text="private heartbeat", source=_source(), internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    adapter._message_handler = handler
+
+    await adapter.handle_message(event)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(_wait_until(lambda: adapter.typing_calls), timeout=1.0)
+    owner = adapter._session_tasks[session_key]
+    owner.cancel()
+    await asyncio.gather(owner, return_exceptions=True)
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+
+    assert adapter.stop_calls
+    assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_completion_stops_typing_and_releases_its_session_guard() -> None:
+    """The same task-owned cleanup covers ordinary Telegram turns."""
+    adapter = _TypingLifecycleAdapter()
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_event):
+        started.set()
+        await release.wait()
+        return "ordinary response"
+
+    adapter._message_handler = handler
+    await adapter.handle_message(MessageEvent(text="ordinary", source=_source()))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(_wait_until(lambda: adapter.typing_calls), timeout=1.0)
+    release.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+
+    assert adapter.sent == ["ordinary response"]
+    assert adapter.stop_calls
+    assert session_key not in adapter._active_sessions
 
 
 def test_private_and_public_pending_events_are_not_merged() -> None:

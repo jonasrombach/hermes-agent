@@ -3348,7 +3348,9 @@ class TestRunConversation:
             result = agent.run_conversation("PRIVATE injected envelope")
 
         assert agent.client.chat.completions.create.called
-        assert result["final_response"] == "NO_REPLY"
+        # The model result remains process-local until BasePlatformAdapter applies
+        # this injection's fail-closed release callback.
+        assert result["final_response"] == "PRIVATE raw assistant output"
         assert not [
             name for name, _kwargs in hook_calls
             if name in {"pre_api_request", "post_api_request"}

@@ -4204,6 +4204,19 @@ class BasePlatformAdapter(ABC):
 
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Dequeue the oldest public/private head without merging their payloads."""
+        pending = self.peek_pending_message(session_key)
+        if pending is None:
+            return None
+        private_q = self._pending_private_messages.get(session_key) or []
+        if private_q and pending is private_q[0]:
+            private_q.pop(0)
+            if not private_q:
+                self._pending_private_messages.pop(session_key, None)
+            return pending
+        return self._pending_messages.pop(session_key, None)
+
+    def peek_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        """Return the oldest queued event without taking ownership of it."""
         public = self._pending_messages.get(session_key)
         private_q = self._pending_private_messages.get(session_key) or []
         private = private_q[0] if private_q else None
@@ -4212,10 +4225,8 @@ class BasePlatformAdapter(ABC):
         if public is not None: self._stamp_pending_order(public)
         if private is not None: self._stamp_pending_order(private)
         if private is not None and (public is None or private._hermes_pending_order < public._hermes_pending_order):
-            private_q.pop(0)
-            if not private_q: self._pending_private_messages.pop(session_key, None)
             return private
-        return self._pending_messages.pop(session_key, None)
+        return public
 
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",

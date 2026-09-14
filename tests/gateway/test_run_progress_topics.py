@@ -953,6 +953,32 @@ class MixedPrivacyQueueAgent:
         }
 
 
+class CapturedPrivateEnvelopeAgent:
+    """The production shape: a normal turn followed by a private envelope."""
+
+    calls = 0
+    envelope = (
+        "[[rocky-wake]]\n"
+        '{"run_id":"38851733f36d45bf8492a1a7afbc5a24","notify":true,'
+        '"message":"released private notification","heartbeat_next":'
+        '{"generation":"g","delay_minutes":17,"mode":"queue"}}\n'
+        "[[/rocky-wake]]"
+    )
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "ordinary user reply" if type(self).calls == 1 else type(self).envelope
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1031,6 +1057,7 @@ async def _run_with_agent(
     scope_id=None,
     private_turn=False,
     pending_private=False,
+    pending_private_transform=None,
     pending_private_sequence=None,
 ):
     if config_data:
@@ -1072,8 +1099,10 @@ async def _run_with_agent(
             message_id="queued-1",
             metadata={"hermes_private_turn": True} if pending_private else {},
         )
+        if pending_private_transform is not None:
+            setattr(pending_event, "_injected_response_transform", pending_private_transform)
         if pending_private:
-            adapter._pending_private_messages[session_key] = pending_event
+            adapter._pending_private_messages[session_key] = [pending_event]
         else:
             adapter._pending_messages[session_key] = pending_event
     if pending_private_sequence is not None:
@@ -1299,6 +1328,33 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_busy_same_session_private_envelope_never_becomes_normal_final_send(monkeypatch, tmp_path):
+    """A private queued wake stays on its event so BasePlatformAdapter owns its release callback."""
+    CapturedPrivateEnvelopeAgent.calls = 0
+    released = []
+
+    def release(response, session_key):
+        released.append((response, session_key))
+        return "released private notification"
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CapturedPrivateEnvelopeAgent,
+        session_id="sess-private-envelope",
+        pending_text="scheduled private heartbeat",
+        pending_private=True,
+        pending_private_transform=release,
+    )
+
+    assert result["final_response"] == "ordinary user reply"
+    assert CapturedPrivateEnvelopeAgent.calls == 1
+    pending = next(iter(adapter._pending_private_messages.values()))[0]
+    assert getattr(pending, "_injected_response_transform") is release
+    assert released == []
 
 
 @pytest.mark.asyncio

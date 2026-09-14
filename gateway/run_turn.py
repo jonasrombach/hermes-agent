@@ -3367,10 +3367,18 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
+            # A private injected event owns its event-local release/lifecycle callbacks.
+            # Keep it on the adapter queue so BasePlatformAdapter processes that exact
+            # event after this ordinary turn, rather than collapsing its raw response
+            # into this turn's normal final-send path.
+            peek_pending = getattr(adapter, "peek_pending_message", None)
+            candidate = peek_pending(session_key) if callable(peek_pending) else None
+            if not bool((getattr(candidate, "metadata", None) or {}).get("hermes_private_turn")):
+                pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            if pending_event is not None:
+                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):

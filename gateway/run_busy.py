@@ -712,6 +712,12 @@ class GatewayBusySessionMixin:
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = (_busy_state.turn.agent if _busy_state else None) or getattr(self, "_running_agents", {}).get(session_key)
+        # A private turn's raw completion belongs to its queued event and must
+        # reach that event-local release callback before an external message can
+        # become model input. Let the adapter keep normal user input at the turn
+        # boundary; ordinary turns retain their configured steer semantics.
+        if not getattr(event, "internal", False) and getattr(running_agent, "_gateway_private_turn", False) is True:
+            return False
         _steer = await self._resolve_busy_steer_or_redirect(event, session_key, effective_mode, running_agent)
         effective_mode, redirected = _steer.effective_mode, _steer.redirected
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
@@ -950,6 +956,8 @@ class GatewayBusySessionMixin:
 
         if running_agent is _AGENT_PENDING_SENTINEL:
             return _queue_fallback("Agent still starting — /steer queued for the next turn.")
+        if getattr(running_agent, "_gateway_private_turn", False) is True:
+            return _queue_fallback("Private turn finishing — /steer queued for the next turn.")
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback("No active agent — /steer queued for the next turn.")
         try:

@@ -143,6 +143,64 @@ async def _wait_until(predicate) -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_follow_up_waits_for_private_release_before_its_own_turn() -> None:
+    """Exercise the live adapter -> GatewayRunner busy path in both turn directions."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
+    adapter = _TypingLifecycleAdapter()
+    runner = GatewayRunner(config=GatewayConfig())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._busy_input_mode = "steer"
+    runner._is_user_authorized_for_source = lambda source, *, allow_adapter_delegation=True: True
+    runner._admit_bot_message_for_source = lambda source: True
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = "agent:main:telegram:dm:private-ambient-chat"
+    private_started = asyncio.Event()
+    release_private = asyncio.Event()
+    released = []
+
+    private_agent = MagicMock()
+    private_agent.steer.return_value = True
+    private_agent._gateway_private_turn = True
+    runner._session_state(session_key).turn.agent = private_agent
+
+    async def handler(event):
+        if (event.metadata or {}).get("hermes_private_turn"):
+            private_started.set()
+            await release_private.wait()
+            return "raw private completion"
+        return "user-visible answer"
+
+    private = MessageEvent(
+        text="private heartbeat", source=_source(), internal=True,
+        metadata={"hermes_private_turn": True},
+    )
+    setattr(
+        private, "_injected_response_transform",
+        lambda response, _session_key: released.append(response) or "NO_REPLY",
+    )
+    user = MessageEvent(text="Restart done.", source=_source())
+    adapter._message_handler = handler
+
+    await adapter.handle_message(private)
+    await asyncio.wait_for(private_started.wait(), timeout=1.0)
+    await adapter.handle_message(user)
+
+    private_agent.steer.assert_not_called()
+    assert adapter._pending_messages[session_key] is user
+    release_private.set()
+    await asyncio.wait_for(
+        _wait_until(lambda: session_key not in adapter._session_tasks), timeout=1.0,
+    )
+
+    assert released == ["raw private completion"]
+    assert adapter.sent == ["user-visible answer"]
+    assert adapter.stop_calls
+    assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
 async def test_private_transform_failure_stops_typing_without_delivering_raw_output() -> None:
     """A malformed/rejected private completion cannot leave a Telegram refresh owner behind."""
     adapter = _TypingLifecycleAdapter()

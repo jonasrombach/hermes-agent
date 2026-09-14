@@ -640,6 +640,9 @@ class GatewayInboundMixin:
                 if queue_during_drain
                 else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
             )
+        if not getattr(event, "internal", False) and getattr(running_agent, "_gateway_private_turn", False) is True:
+            self._queue_or_replace_pending_event(_quick_key, event)  # type: ignore[reportAttributeAccessIssue]  # mixed in by GatewayBusySessionMixin
+            return None
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
             self._queue_or_replace_pending_event(_quick_key, event)

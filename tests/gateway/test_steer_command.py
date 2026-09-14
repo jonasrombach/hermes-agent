@@ -121,6 +121,42 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
 
 
 @pytest.mark.asyncio
+async def test_steer_queues_behind_an_isolated_private_turn():
+    """Explicit user steering cannot cross a private event's release boundary."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    private_agent = MagicMock()
+    private_agent.steer.return_value = True
+    private_agent._gateway_private_turn = True
+    runner._running_agents[sk] = private_agent
+
+    result = await runner._handle_message(_make_event("/steer wait for the heartbeat"))
+
+    assert "queued" in result.lower()
+    private_agent.steer.assert_not_called()
+    assert adapter._pending_messages[sk].text == "wait for the heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_plain_busy_input_queues_behind_an_isolated_private_turn():
+    """The direct runner busy path has the same private release boundary."""
+    runner, adapter = _make_runner(_session_entry())
+    runner._busy_input_mode = "steer"
+    runner._draining = False
+    sk = build_session_key(_make_source())
+    private_agent = MagicMock()
+    private_agent.steer.return_value = True
+    private_agent._gateway_private_turn = True
+    runner._running_agents[sk] = private_agent
+
+    result = await runner._handle_message(_make_event("Restart done."))
+
+    assert result is None
+    private_agent.steer.assert_not_called()
+    assert adapter._pending_messages[sk].text == "Restart done."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("elapsed", [float("nan"), True, "not-a-number"])
 async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
     monkeypatch, elapsed

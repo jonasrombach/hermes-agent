@@ -228,6 +228,34 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+    async def test_steer_mode_does_not_join_an_isolated_private_turn(self, monkeypatch):
+        """External input waits for a private turn's event-local completion boundary."""
+        import gateway.run as _gr
+
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="Restart done.")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        private_agent = MagicMock()
+        private_agent.steer.return_value = True
+        private_agent._gateway_private_turn = True
+        runner._running_agents[sk] = private_agent
+
+        handled = await runner._handle_active_session_busy_message(event, sk)
+
+        # Returning False delegates the event to BasePlatformAdapter's normal
+        # queue, which preserves the private event and its release callback.
+        assert handled is False
+        private_agent.steer.assert_not_called()
+        private_agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
         """A busy voice follow-up is transcribed and steered, never queued."""
         import gateway.run as _gr
